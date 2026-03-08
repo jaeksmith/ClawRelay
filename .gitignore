@@ -1,0 +1,6 @@
+node_modules/
+cats-state.json
+location-state.json
+location-history.jsonl
+firebase-service-account.json
+*.log

@@ -1,0 +1,763 @@
+const express = require('express');
+const { WebSocketServer } = require('ws');
+const admin = require('firebase-admin');
+const path = require('path');
+const cats = require('./cats');
+const location = require('./location');
+
+const WS_PORT = 18790;
+const HTTP_PORT = 18791;
+const AUTH_TOKEN = process.env.RELAY_TOKEN || 'claw-relay-default';
+
+// --- Firebase Admin init ---
+const serviceAccountPath = path.join(__dirname, 'firebase-service-account.json');
+try {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccountPath)
+  });
+  console.log('[firebase] Admin SDK initialized');
+} catch (e) {
+  console.error('[firebase] Failed to init:', e.message);
+}
+
+// --- WebSocket Server (for app connections) ---
+const wss = new WebSocketServer({ port: WS_PORT, host: '0.0.0.0' });
+const clients = new Map(); // id -> { ws, info, fcmToken, connectedAt }
+const commandWaiters = new Map(); // commandId -> { resolve, timer }
+let lastKnownFcmToken = null;
+
+// Push a message to all (or specific) connected clients + SSE web dashboard
+function pushToClients(payload, targetId = null) {
+  const msg = JSON.stringify({ type: 'command', commandId: `push-${Date.now()}`, ...payload });
+  for (const [id, client] of clients) {
+    if (targetId && id !== targetId) continue;
+    if (client.ws.readyState === 1) {
+      client.ws.send(msg);
+    }
+  }
+  // Mirror to SSE dashboard clients
+  const isCatAction = payload.action?.startsWith('cat') || payload.action === 'mute_state';
+  broadcastSSE('update', {
+    action: payload.action,
+    cats: isCatAction ? cats.getStateSnapshot() : undefined,
+    location: payload.action === 'location_update' ? location.getCurrent() : undefined,
+    clients: clients.size,
+  });
+}
+
+// Init cats module with push function
+cats.init(pushToClients);
+
+wss.on('connection', (ws, req) => {
+  const clientId = `app-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+  console.log(`[ws] Client connected: ${clientId} from ${req.socket.remoteAddress}`);
+
+  clients.set(clientId, { ws, info: {}, fcmToken: null, connectedAt: new Date().toISOString() });
+  cancelFcmWake();
+
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data);
+
+      if (msg.type === 'register') {
+        const client = clients.get(clientId);
+        if (!client) return;
+        client.info = msg.info || {};
+        if (msg.fcmToken) {
+          client.fcmToken = msg.fcmToken;
+          lastKnownFcmToken = msg.fcmToken;
+          console.log(`[ws] FCM token registered for ${clientId}: ${msg.fcmToken.substring(0, 20)}...`);
+        }
+        ws.send(JSON.stringify({ type: 'registered', clientId }));
+        // Send current cat state snapshot to new client
+        ws.send(JSON.stringify(cats.getStateSnapshot()));
+        // Send named locations to new client
+        ws.send(JSON.stringify({ type: 'location_places', places: location.getNamedLocations() }));
+
+      } else if (msg.type === 'cat_state_update') {
+        // App changed a cat state — update server and broadcast to other clients
+        const result = cats.setCatState(msg.catName, msg.state, 'app');
+        console.log(`[ws] Cat state update from app: ${msg.catName} → ${msg.state}`, result);
+        ws.send(JSON.stringify({ type: 'cat_state_ack', ...result }));
+
+      } else if (msg.type === 'request_test_ping') {
+        // App asks server to send a ping back — tests full round-trip
+        const message = msg.message || 'Server test ping — round trip confirmed!';
+        const commandId = `cmd-test-${Date.now()}`;
+        ws.send(JSON.stringify({ type: 'command', action: 'ping', message, commandId }));
+        console.log(`[ws] Server test ping sent to ${clientId}`);
+
+      } else if (msg.type === 'ack') {
+        const waiter = commandWaiters.get(msg.commandId);
+        if (waiter) {
+          waiter.resolve({ delivered: true, via: 'websocket', clientId });
+          commandWaiters.delete(msg.commandId);
+        }
+
+      } else if (msg.type === 'add_notification') {
+        const result = cats.addNotification(msg.notification || {});
+        ws.send(JSON.stringify({ type: 'notification_ack', ...result }));
+        // Broadcast updated snapshot so all clients stay in sync
+        pushToClients(cats.getStateSnapshot());
+
+      } else if (msg.type === 'update_notification') {
+        const result = cats.updateNotification(msg.id, msg.patch || {});
+        ws.send(JSON.stringify({ type: 'notification_ack', ...result }));
+        pushToClients(cats.getStateSnapshot());
+
+      } else if (msg.type === 'remove_notification') {
+        const result = cats.removeNotification(msg.id);
+        ws.send(JSON.stringify({ type: 'notification_ack', ...result }));
+        pushToClients(cats.getStateSnapshot());
+
+      } else if (msg.type === 'restart_repeating') {
+        // App user hit "Restart" — reset repeating timers to initialDelay
+        cats.restartRepeatingTimers();
+        console.log(`[ws] Repeating timers restarted by ${clientId}`);
+        pushToClients(cats.getStateSnapshot());
+
+      } else if (msg.type === 'set_mute') {
+        // App setting mute state — broadcast to all clients
+        const result = cats.setMute(msg.until || null);
+        console.log(`[ws] Mute set by ${clientId}: until=${msg.until}`);
+        ws.send(JSON.stringify({ type: 'mute_ack', ...result }));
+
+      } else if (msg.type === 'location_update') {
+        if (location.isTracking()) {
+          const result = location.processUpdate(msg);
+          // Push inferred location to all clients if it changed
+          if (result.logged) {
+            pushToClients({ action: 'location_update', current: location.getCurrent() });
+          }
+        }
+
+      } else if (msg.type === 'set_location_tracking') {
+        location.setTracking(!!msg.enabled);
+        ws.send(JSON.stringify({ type: 'location_tracking_ack', tracking: location.isTracking() }));
+
+      } else if (msg.type === 'save_named_location') {
+        const result = location.addNamedLocation(msg.location || {});
+        ws.send(JSON.stringify({ type: 'named_location_ack', ...result }));
+        // Broadcast updated places list to all clients
+        pushToClients({ action: 'location_places', places: location.getNamedLocations() });
+
+      } else if (msg.type === 'pong') {
+        // keepalive
+      }
+    } catch (e) {
+      console.error(`[ws] Bad message from ${clientId}:`, e.message);
+    }
+  });
+
+  ws.on('close', () => {
+    console.log(`[ws] Client disconnected: ${clientId}`);
+    clients.delete(clientId);
+    if (clients.size === 0) scheduleFcmWake();
+  });
+
+  ws.on('error', (err) => console.error(`[ws] Error for ${clientId}:`, err.message));
+
+  ws.send(JSON.stringify({ type: 'welcome', clientId }));
+});
+
+// --- FCM wake-on-disconnect ---
+// If no clients remain connected, prod the app back via FCM with exponential backoff.
+// Resets on reconnect. 1min → 2min → 4min → ... → 30min → 30min → ...
+const FCM_WAKE_INITIAL = 60 * 1000;
+const FCM_WAKE_MAX = 30 * 60 * 1000;
+let fcmWakeTimer = null;
+let fcmWakeDelay = FCM_WAKE_INITIAL;
+
+function scheduleFcmWake() {
+  if (fcmWakeTimer) return;
+  if (clients.size > 0) return;
+  if (!lastKnownFcmToken) { console.log('[wake] No FCM token, skipping wake schedule'); return; }
+
+  console.log(`[wake] No clients — scheduling FCM wake in ${Math.round(fcmWakeDelay/1000)}s`);
+  fcmWakeTimer = setTimeout(async () => {
+    fcmWakeTimer = null;
+    if (clients.size > 0) { fcmWakeDelay = FCM_WAKE_INITIAL; return; } // reconnected, reset
+
+    try {
+      await admin.messaging().send({
+        token: lastKnownFcmToken,
+        // notification payload: FCM system shows this even if app is killed (bypasses Samsung battery kill)
+        notification: { title: 'ClawApp', body: 'Reconnecting to relay...' },
+        data: { action: 'wake', reason: 'relay_reconnect' },
+        android: {
+          priority: 'high',
+          ttl: 60000,
+          notification: { channelId: 'claw_alerts', priority: 'max' }
+        }
+      });
+      console.log('[wake] FCM wake sent');
+    } catch (e) {
+      console.error('[wake] FCM wake failed:', e.message);
+    }
+
+    // Schedule next attempt with backoff
+    fcmWakeDelay = Math.min(fcmWakeDelay * 2, FCM_WAKE_MAX);
+    scheduleFcmWake();
+  }, fcmWakeDelay);
+}
+
+function cancelFcmWake() {
+  if (fcmWakeTimer) { clearTimeout(fcmWakeTimer); fcmWakeTimer = null; }
+  fcmWakeDelay = FCM_WAKE_INITIAL; // reset backoff on reconnect
+  console.log('[wake] Client connected — FCM wake cancelled, backoff reset');
+}
+
+// Keepalive ping every 25s
+setInterval(() => {
+  for (const [, client] of clients) {
+    if (client.ws.readyState === 1) client.ws.send(JSON.stringify({ type: 'ping' }));
+  }
+}, 25000);
+
+// --- Command delivery with FCM fallback ---
+async function deliverCommand(commandData) {
+  const { action, message, clientId: targetId, ...extra } = commandData;
+  const commandId = `cmd-${Date.now()}`;
+  const payload = JSON.stringify({ type: 'command', commandId, action, message: message || '', ...extra });
+
+  let wsSent = 0;
+  let fcmToken = null;
+  for (const [id, client] of clients) {
+    if (targetId && id !== targetId) continue;
+    if (client.ws.readyState === 1) { client.ws.send(payload); wsSent++; }
+    if (client.fcmToken) fcmToken = client.fcmToken;
+  }
+
+  if (wsSent > 0) {
+    const result = await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        commandWaiters.delete(commandId);
+        resolve({ delivered: true, via: 'websocket', acked: false });
+      }, 5000);
+      commandWaiters.set(commandId, {
+        resolve: (r) => { clearTimeout(timer); resolve({ ...r, acked: true }); }
+      });
+    });
+    return { ok: true, commandId, ...result };
+  }
+
+  fcmToken = fcmToken || lastKnownFcmToken;
+  if (fcmToken) {
+    try {
+      await admin.messaging().send({
+        token: fcmToken,
+        data: { action, message: message || '', commandId },
+        android: { priority: 'high', ttl: 60000 }
+      });
+      return { ok: true, commandId, delivered: true, via: 'fcm' };
+    } catch (e) {
+      return { ok: false, commandId, error: 'fcm_failed', detail: e.message };
+    }
+  }
+
+  return { ok: false, commandId, error: 'no_clients' };
+}
+
+// --- HTTP API ---
+const app = express();
+app.use(express.json());
+
+function authCheck(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '') || req.query.token;
+  if (token !== AUTH_TOKEN) return res.status(401).json({ error: 'unauthorized' });
+  next();
+}
+
+// General
+app.get('/health', authCheck, (req, res) => {
+  res.json({ ok: true, clients: clients.size, fcmAvailable: !!lastKnownFcmToken });
+});
+
+app.get('/clients', authCheck, (req, res) => {
+  const list = [];
+  for (const [id, client] of clients) {
+    list.push({ id, info: client.info, fcmToken: client.fcmToken ? '***' + client.fcmToken.slice(-8) : null, connectedAt: client.connectedAt, ready: client.ws.readyState === 1 });
+  }
+  res.json({ clients: list, lastKnownFcmToken: !!lastKnownFcmToken });
+});
+
+app.post('/command', authCheck, async (req, res) => {
+  if (!req.body.action) return res.status(400).json({ error: 'action required' });
+  res.json(await deliverCommand(req.body));
+});
+
+// ---- Cat API ----
+
+// GET /cats — all cat states + notifications
+app.get('/cats', authCheck, (req, res) => {
+  res.json(cats.getAll());
+});
+
+// GET /cats/:name — single cat
+app.get('/cats/:name', authCheck, (req, res) => {
+  const cat = cats.getCat(req.params.name);
+  if (!cat) return res.status(404).json({ error: 'cat not found' });
+  res.json({ name: req.params.name, ...cat });
+});
+
+// POST /cats/:name/state — set cat state
+// Body: { state: 'inside' | 'outside' | 'unknown' }
+app.post('/cats/:name/state', authCheck, (req, res) => {
+  const { state } = req.body;
+  if (!['inside', 'outside', 'unknown'].includes(state)) {
+    return res.status(400).json({ error: 'state must be inside | outside | unknown' });
+  }
+  res.json(cats.setCatState(req.params.name, state, 'claw'));
+});
+
+// POST /cats/:name/config — update cat config (name, outdoorOnly, image, etc.)
+app.post('/cats/:name/config', authCheck, (req, res) => {
+  res.json(cats.updateCatConfig(req.params.name, req.body));
+});
+
+// GET /cats/notifications — list notification configs
+app.get('/cats/notifications', authCheck, (req, res) => {
+  res.json({ notifications: cats.getAll().notifications });
+});
+
+// POST /cats/notifications — replace all notifications
+app.put('/cats/notifications', authCheck, (req, res) => {
+  if (!Array.isArray(req.body.notifications)) {
+    return res.status(400).json({ error: 'notifications array required' });
+  }
+  res.json(cats.setNotifications(req.body.notifications));
+});
+
+// POST /cats/notifications/add — add one notification
+app.post('/cats/notifications/add', authCheck, (req, res) => {
+  res.json(cats.addNotification(req.body));
+});
+
+// PATCH /cats/notifications/:id — update notification
+app.patch('/cats/notifications/:id', authCheck, (req, res) => {
+  res.json(cats.updateNotification(req.params.id, req.body));
+});
+
+// DELETE /cats/notifications/:id — remove notification
+app.delete('/cats/notifications/:id', authCheck, (req, res) => {
+  res.json(cats.removeNotification(req.params.id));
+});
+
+// ---- Mute API ----
+
+// GET /mute — get current mute state
+app.get('/mute', authCheck, (req, res) => {
+  res.json(cats.getMute());
+});
+
+// POST /mute — set mute (body: { until: timestamp } or { until: null } to unmute)
+app.post('/mute', authCheck, (req, res) => {
+  res.json(cats.setMute(req.body.until || null));
+});
+
+// ---- Location API ----
+
+app.get('/location/current', authCheck, (req, res) => {
+  res.json(location.getCurrent() || { error: 'no location data yet' });
+});
+
+app.get('/location/history', authCheck, (req, res) => {
+  const limit = parseInt(req.query.limit) || 100;
+  res.json({ history: location.getHistory(limit) });
+});
+
+app.get('/location/places', authCheck, (req, res) => {
+  res.json({ places: location.getNamedLocations() });
+});
+
+app.post('/location/places', authCheck, (req, res) => {
+  res.json(location.addNamedLocation(req.body));
+});
+
+app.patch('/location/places/:id', authCheck, (req, res) => {
+  res.json(location.updateNamedLocation(req.params.id, req.body));
+});
+
+app.delete('/location/places/:id', authCheck, (req, res) => {
+  res.json(location.removeNamedLocation(req.params.id));
+});
+
+// "I'm here" — manually override inferred location to a named place
+// Body: { name: "home" }  — must match an existing named location
+app.post('/location/here', authCheck, (req, res) => {
+  const { name } = req.body;
+  if (!name) return res.status(400).json({ error: 'name required' });
+  const place = location.getNamedLocations().find(l => l.name.toLowerCase() === name.toLowerCase());
+  if (!place) return res.status(404).json({ error: 'place not found' });
+  location.setManualLocation(name);
+  broadcastSSE('update', { location: location.getCurrent(), clients: clients.size });
+  res.json({ ok: true, name });
+});
+
+app.post('/location/tracking', authCheck, (req, res) => {
+  location.setTracking(!!req.body.enabled);
+  res.json({ tracking: location.isTracking() });
+});
+
+// --- SSE: real-time event stream for the web dashboard ---
+const sseClients = new Set();
+
+function broadcastSSE(event, data) {
+  const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of sseClients) {
+    try { res.write(msg); } catch (_) { sseClients.delete(res); }
+  }
+}
+
+app.get('/events', authCheck, (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+  sseClients.add(res);
+
+  // Send current state immediately on connect
+  res.write(`event: init\ndata: ${JSON.stringify({
+    cats: cats.getStateSnapshot(),
+    location: location.getCurrent(),
+    places: location.getNamedLocations(),
+    clients: clients.size,
+  })}\n\n`);
+
+  req.on('close', () => sseClients.delete(res));
+});
+
+// --- Web Dashboard ---
+app.get('/dashboard', (req, res) => {
+  // Token in query param for browser access
+  const token = req.query.token;
+  if (token !== AUTH_TOKEN) {
+    return res.status(401).send('<h2>Unauthorized — add ?token=YOUR_TOKEN to the URL</h2>');
+  }
+  const t = encodeURIComponent(token);
+  res.setHeader('Content-Type', 'text/html');
+  res.send(buildDashboardHtml(t));
+});
+
+function buildDashboardHtml(token) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>🦀 ClawApp Dashboard</title>
+<style>
+  :root {
+    --bg: #121212; --surface: #1e1e1e; --surface2: #2a2a2a;
+    --primary: #bb86fc; --green: #4caf50; --yellow: #ffc107;
+    --red: #f44336; --text: #e0e0e0; --muted: #888;
+    --border: #333;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 16px; }
+  h1 { color: var(--primary); margin-bottom: 16px; font-size: 1.4rem; display: flex; align-items: center; gap: 8px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .card { background: var(--surface); border-radius: 12px; padding: 16px; border: 1px solid var(--border); }
+  .card h2 { font-size: 0.9rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; }
+  .status-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+  .dot.green { background: var(--green); }
+  .dot.red { background: var(--red); }
+  .dot.gray { background: var(--muted); }
+  .dot.yellow { background: var(--yellow); }
+  .cat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 8px; }
+  .cat-tile { background: var(--surface2); border-radius: 8px; padding: 10px 8px; text-align: center; border: 2px solid transparent; transition: border-color 0.2s; }
+  .cat-tile.outside { border-color: var(--yellow); }
+  .cat-tile.inside { border-color: var(--green); }
+  .cat-tile.unknown { border-color: var(--muted); }
+  .cat-name { font-size: 0.8rem; font-weight: 600; margin-top: 4px; }
+  .cat-state { font-size: 0.65rem; color: var(--muted); margin-top: 2px; }
+  .cat-emoji { font-size: 1.6rem; }
+  .state-btn { background: var(--surface); border: 1px solid var(--border); color: var(--muted); border-radius: 4px; padding: 2px 7px; font-size: 0.65rem; cursor: pointer; transition: all 0.15s; }
+  .state-btn:hover { border-color: var(--primary); color: var(--text); }
+  .state-btn.active-btn { background: var(--primary); color: #000; border-color: var(--primary); font-weight: 700; }
+  .btn { background: var(--primary); color: #000; border: none; border-radius: 8px; padding: 8px 16px; cursor: pointer; font-size: 0.85rem; font-weight: 600; transition: opacity 0.15s; }
+  .btn:hover { opacity: 0.85; }
+  .btn.danger { background: var(--red); color: #fff; }
+  .btn.secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .loc-badge { display: inline-flex; align-items: center; gap: 6px; background: var(--surface2); border-radius: 20px; padding: 4px 12px; font-size: 0.85rem; }
+  .conf-bar { height: 4px; border-radius: 2px; margin-top: 8px; background: var(--surface2); }
+  .conf-fill { height: 100%; border-radius: 2px; transition: width 0.3s; }
+  .mute-banner { background: #3a2a00; border: 1px solid var(--yellow); border-radius: 8px; padding: 10px 14px; margin-bottom: 16px; display: none; }
+  .input { background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 8px 12px; font-size: 0.9rem; width: 100%; }
+  .tag { font-size: 0.7rem; padding: 2px 8px; border-radius: 10px; background: var(--surface2); color: var(--muted); }
+  .tag.green { background: #1a3a1a; color: var(--green); }
+  .tag.yellow { background: #3a3000; color: var(--yellow); }
+  #conn-status { font-size: 0.8rem; color: var(--muted); }
+  .timestamp { font-size: 0.7rem; color: var(--muted); margin-top: 4px; }
+</style>
+</head>
+<body>
+<h1>🦀 ClawApp <span id="conn-status">connecting...</span></h1>
+
+<div id="mute-banner" class="mute-banner" style="display:none">
+  🔕 Muted until <span id="mute-until">—</span>
+  <button class="btn secondary" style="margin-left:12px;padding:4px 10px;font-size:0.75rem" onclick="unmute()">Unmute</button>
+</div>
+
+<div class="grid">
+  <!-- Cats -->
+  <div class="card" style="grid-column: 1 / -1">
+    <h2>🐱 Cats</h2>
+    <div id="cat-grid" class="cat-grid">Loading...</div>
+  </div>
+
+  <!-- Location -->
+  <div class="card">
+    <h2>📍 Location</h2>
+    <div id="loc-display">No data yet</div>
+    <div class="conf-bar"><div id="conf-fill" class="conf-fill" style="width:0;background:var(--green)"></div></div>
+    <div class="timestamp" id="loc-time">—</div>
+    <div class="btn-row">
+      <input id="loc-name-input" class="input" placeholder="Name this location..." style="flex:1" />
+      <button class="btn secondary" onclick="saveLocation()">Save</button>
+    </div>
+  </div>
+
+  <!-- Connection & Controls -->
+  <div class="card">
+    <h2>⚡ Controls</h2>
+    <div class="status-row">
+      <div id="app-dot" class="dot gray"></div>
+      <span id="app-status">App not connected</span>
+    </div>
+    <div class="btn-row">
+      <button class="btn secondary" onclick="testPing()">📍 Test Ping</button>
+      <button class="btn secondary" onclick="muteQuick(60)">🔕 Mute 1h</button>
+      <button class="btn secondary" onclick="muteQuick(0)">🔔 Unmute</button>
+    </div>
+  </div>
+
+  <!-- Mute Controls -->
+  <div class="card">
+    <h2>🔔 Mute</h2>
+    <div id="mute-status">—</div>
+    <div class="btn-row" style="margin-top:8px">
+      <button class="btn secondary" onclick="muteQuick(30)">30m</button>
+      <button class="btn secondary" onclick="muteQuick(60)">1h</button>
+      <button class="btn secondary" onclick="muteQuick(120)">2h</button>
+      <button class="btn secondary" onclick="muteQuick(240)">4h</button>
+      <button class="btn danger" onclick="unmute()">Unmute</button>
+    </div>
+  </div>
+
+  <!-- Named Places -->
+  <div class="card">
+    <h2>🗺️ Known Places</h2>
+    <div id="places-list">—</div>
+  </div>
+</div>
+
+<script>
+const TOKEN = '${token}';
+const BASE = window.location.origin;
+
+let state = { cats: {}, location: null, clients: 0, mute: null };
+
+// SSE connection
+function connectSSE() {
+  const es = new EventSource(BASE + '/events?token=' + TOKEN);
+  es.addEventListener('init', e => {
+    const d = JSON.parse(e.data);
+    applyInit(d);
+    document.getElementById('conn-status').textContent = '● live';
+    document.getElementById('conn-status').style.color = '#4caf50';
+  });
+  es.addEventListener('update', e => {
+    const d = JSON.parse(e.data);
+    if (d.cats?.cats) Object.assign(state.cats, d.cats.cats);
+    if (d.cats?.mute) state.mute = d.cats.mute;
+    if (d.location !== undefined) state.location = d.location;
+    if (d.mute !== undefined) state.mute = d.mute;
+    if (d.clients !== undefined) state.clients = d.clients;
+    render();
+  });
+  es.onerror = () => {
+    document.getElementById('conn-status').textContent = '● reconnecting...';
+    document.getElementById('conn-status').style.color = '#f44336';
+  };
+}
+
+function applyInit(d) {
+  if (d.cats?.cats) state.cats = d.cats.cats;         // snapshot key is .cats, not .state
+  if (d.cats?.mute) state.mute = d.cats.mute;
+  state.location = d.location;
+  state.places = d.places || [];
+  state.clients = d.clients || 0;
+  render();
+}
+
+const CAT_EMOJI = { Ty:'🖤', GentlemanMustachios:'🎩', Nocci:'🍊', Nommy:'🧡', Smoresy:'💜', Cay:'🐾' };
+
+function render() {
+  // Cats
+  const catGrid = document.getElementById('cat-grid');
+  const catEntries = Object.entries(state.cats || {});
+  if (catEntries.length === 0) { catGrid.textContent = 'No cats yet'; }
+  else {
+    catGrid.innerHTML = catEntries.map(([name, cat]) => {
+      const st = cat.state || 'unknown';
+      const emoji = CAT_EMOJI[name] || '🐱';
+      const ago = cat.stateSetAt ? timeAgo(cat.stateSetAt) : '';
+      const safeName = name.replace(/'/g, "\\'");
+      const isOutdoorOnly = cat.outdoorOnly;
+      return \`<div class="cat-tile \${st}">
+        <div class="cat-emoji">\${emoji}</div>
+        <div class="cat-name">\${name}</div>
+        <div class="cat-state">\${st}\${ago ? ' · '+ago : ''}</div>
+        \${!isOutdoorOnly ? \`<div style="display:flex;gap:4px;margin-top:6px;justify-content:center">
+          <button class="state-btn\${st==='inside'?' active-btn':''}" onclick="setCatState('\${safeName}','inside')">in</button>
+          <button class="state-btn\${st==='outside'?' active-btn':''}" onclick="setCatState('\${safeName}','outside')">out</button>
+          <button class="state-btn\${st==='unknown'?' active-btn':''}" onclick="setCatState('\${safeName}','unknown')">?</button>
+        </div>\` : '<div style="font-size:0.65rem;color:var(--muted);margin-top:4px">outdoor</div>'}
+      </div>\`;
+    }).join('');
+  }
+
+  // Location
+  const loc = state.location;
+  const locEl = document.getElementById('loc-display');
+  const confFill = document.getElementById('conf-fill');
+  const locTime = document.getElementById('loc-time');
+  if (loc) {
+    const conf = loc.locationConfidence ?? 0;
+    const name = loc.inferredName;
+    locEl.innerHTML = name
+      ? \`<span class="loc-badge">\${name} <span class="tag \${conf>=60?'green':'yellow'}">\${conf}%</span></span>\`
+      : \`<span class="loc-badge">Unknown · ±\${loc.accuracy ? Math.round(loc.accuracy) : '?'}m</span>\`;
+    confFill.style.width = conf + '%';
+    confFill.style.background = conf >= 60 ? 'var(--green)' : 'var(--yellow)';
+    locTime.textContent = loc.timestamp ? 'Updated ' + timeAgo(loc.timestamp) : '';
+  } else { locEl.textContent = 'No location data'; }
+
+  // App connection
+  const appDot = document.getElementById('app-dot');
+  const appStatus = document.getElementById('app-status');
+  if (state.clients > 0) {
+    appDot.className = 'dot green';
+    appStatus.textContent = 'App connected';
+  } else {
+    appDot.className = 'dot red';
+    appStatus.textContent = 'App not connected';
+  }
+
+  // Mute
+  const mute = state.mute;
+  const muteEl = document.getElementById('mute-status');
+  const muteBanner = document.getElementById('mute-banner');
+  if (mute?.until && mute.until > Date.now()) {
+    const until = new Date(mute.until);
+    muteEl.textContent = '🔕 Muted until ' + until.toLocaleTimeString();
+    document.getElementById('mute-until').textContent = until.toLocaleTimeString();
+    muteBanner.style.display = 'block';
+  } else {
+    muteEl.textContent = '🔔 Active';
+    muteBanner.style.display = 'none';
+  }
+
+  // Places — clickable "I'm here" + delete
+  const placesEl = document.getElementById('places-list');
+  if (state.places?.length) {
+    const curName = state.location?.inferredName;
+    placesEl.innerHTML = state.places.map(p => {
+      const isHere = p.name === curName;
+      return \`<div class="status-row" style="justify-content:space-between;margin-bottom:6px">
+        <div style="display:flex;align-items:center;gap:8px">
+          <span>\${isHere ? '📍' : '🗺️'}</span>
+          <span style="font-weight:\${isHere?'700':'400'}">\${p.name}</span>
+          <span class="tag\${isHere?' green':''}">\${p.wifiFingerprint?.length || 0} APs\${isHere?' · here':''}</span>
+        </div>
+        <div style="display:flex;gap:6px">
+          <button class="btn secondary" style="padding:3px 10px;font-size:0.75rem" onclick="setHere('\${p.name.replace(/'/g,\"\\\\'\")}')">I'm here</button>
+          <button class="btn danger" style="padding:3px 8px;font-size:0.75rem" onclick="deletePlace('\${p.id}')">✕</button>
+        </div>
+      </div>\`;
+    }).join('');
+  } else { placesEl.textContent = 'No saved places yet'; }
+}
+
+function setCatState(name, newState) {
+  api('POST', '/cats/' + encodeURIComponent(name) + '/state', { state: newState })
+    .then(d => {
+      if (d.ok && state.cats[name]) {
+        state.cats[name] = { ...state.cats[name], state: newState, stateSetAt: Date.now() };
+        render();
+      }
+    });
+}
+
+function timeAgo(ts) {
+  const s = Math.round((Date.now() - ts) / 1000);
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.round(s/60) + 'm ago';
+  return Math.round(s/3600) + 'h ago';
+}
+
+async function api(method, path, body) {
+  const r = await fetch(BASE + path + '?token=' + TOKEN, {
+    method, headers: body ? {'Content-Type':'application/json'} : {},
+    body: body ? JSON.stringify(body) : undefined
+  });
+  return r.json();
+}
+
+function testPing() {
+  api('POST', '/command', { action: 'ping', message: 'Test ping from web dashboard' });
+}
+
+function muteQuick(minutes) {
+  if (minutes === 0) { unmute(); return; }
+  api('POST', '/cats/mute', { until: Date.now() + minutes * 60000 });
+}
+
+function unmute() {
+  api('POST', '/cats/mute', { until: null });
+}
+
+function saveLocation() {
+  const name = document.getElementById('loc-name-input').value.trim();
+  if (!name) return;
+  api('POST', '/location/places', {
+    name,
+    lat: state.location?.lat,
+    lng: state.location?.lng,
+    radiusM: Math.max(40, (state.location?.accuracy || 40) * 2),
+    wifiFingerprint: state.location?.wifiScan || []
+  }).then(() => { document.getElementById('loc-name-input').value = ''; refreshPlaces(); });
+}
+
+function setHere(name) {
+  api('POST', '/location/here', { name }).then(() => {
+    if (state.location) state.location = { ...state.location, inferredName: name, locationConfidence: 100 };
+    render();
+  });
+}
+
+function deletePlace(id) {
+  if (!confirm('Delete this place?')) return;
+  api('DELETE', '/location/places/' + id).then(() => refreshPlaces());
+}
+
+function refreshPlaces() {
+  api('GET', '/location/places').then(d => { state.places = d.places || []; render(); });
+}
+
+// Poll for updates every 10s as SSE backup + update timestamps
+setInterval(() => render(), 10000);
+
+connectSSE();
+</script>
+</body>
+</html>`;
+}
+
+app.listen(HTTP_PORT, '0.0.0.0', () => {
+  console.log(`[relay] HTTP API on 0.0.0.0:${HTTP_PORT}`);
+  console.log(`[relay] WebSocket on 0.0.0.0:${WS_PORT}`);
+});
