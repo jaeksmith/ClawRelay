@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# relay — ClawRelay CLI
+# Usage: relay <command> [args...]
+#
+# Config (override via env):
+#   RELAY_HOST  — default: 100.126.78.128
+#   RELAY_PORT  — default: 18791
+#   RELAY_TOKEN — default: 7cbb1baa6b7737dfeae90c9865ec0e14
+
+RELAY_HOST="${RELAY_HOST:-100.126.78.128}"
+RELAY_PORT="${RELAY_PORT:-18791}"
+RELAY_TOKEN="${RELAY_TOKEN:-7cbb1baa6b7737dfeae90c9865ec0e14}"
+BASE="http://${RELAY_HOST}:${RELAY_PORT}"
+AUTH="Authorization: Bearer ${RELAY_TOKEN}"
+
+_cmd() {
+  curl -sf -X POST "${BASE}/command" \
+    -H "Content-Type: application/json" \
+    -H "${AUTH}" \
+    -d "$1"
+}
+
+_get() {
+  curl -sf "${BASE}/$1" -H "${AUTH}"
+}
+
+_post() {
+  curl -sf -X POST "${BASE}/$1" \
+    -H "Content-Type: application/json" \
+    -H "${AUTH}" \
+    -d "$2"
+}
+
+usage() {
+  cat <<EOF
+Usage: relay <command> [args]
+
+Phone commands:
+  ping [message]              Alarm + vibrate on phone
+  tts <message>               Speak message via TTS
+  vibrate                     Vibrate only
+  notify <title> <message>    Silent notification
+
+Cat watch:
+  cat-state <name> <inside|outside|unknown>
+  cat-list                    Show all cat states
+  mute [minutes]              Mute notifications (default: 60 min)
+  unmute                      Clear mute
+
+Relay status:
+  status                      Health check
+  clients                     Connected WS clients
+  repeating                   Current repeating timer state
+
+EOF
+  exit 1
+}
+
+CMD="${1:-}"
+shift || true
+
+case "$CMD" in
+  ping)
+    MSG="${1:-Ping from Claw 🦀}"
+    _cmd "{\"action\":\"ping\",\"message\":$(printf '%s' "$MSG" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}"
+    ;;
+  tts)
+    [[ -z "${1:-}" ]] && { echo "Usage: relay tts <message>"; exit 1; }
+    MSG="$*"
+    _cmd "{\"action\":\"tts\",\"message\":$(printf '%s' "$MSG" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}"
+    ;;
+  vibrate)
+    _cmd '{"action":"vibrate","message":""}'
+    ;;
+  notify)
+    TITLE="${1:-Claw}"; shift || true
+    MSG="${*:-}"
+    _cmd "{\"action\":\"notify\",\"title\":$(printf '%s' "$TITLE" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),\"message\":$(printf '%s' "$MSG" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}"
+    ;;
+  cat-state)
+    NAME="${1:-}"; STATE="${2:-}"
+    [[ -z "$NAME" || -z "$STATE" ]] && { echo "Usage: relay cat-state <name> <inside|outside|unknown>"; exit 1; }
+    _post "cats/${NAME}/state" "{\"state\":\"${STATE}\"}"
+    ;;
+  cat-list)
+    _get "cats" | python3 -m json.tool 2>/dev/null || _get "cats"
+    ;;
+  mute)
+    MINUTES="${1:-60}"
+    UNTIL=$(( $(date +%s) * 1000 + MINUTES * 60000 ))
+    _post "mute" "{\"until\":${UNTIL}}"
+    ;;
+  unmute)
+    _post "mute" '{"until":null}'
+    ;;
+  status)
+    _get "health" | python3 -m json.tool 2>/dev/null || _get "health"
+    ;;
+  clients)
+    _get "clients" | python3 -m json.tool 2>/dev/null || _get "clients"
+    ;;
+  repeating)
+    _get "cats" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+rs = d.get('repeatingState', {})
+if not rs:
+    print('No armed repeating timers')
+else:
+    import datetime
+    for nid, v in rs.items():
+        nf = v.get('nextFireAt', 0) / 1000
+        dt = datetime.datetime.fromtimestamp(nf).strftime('%H:%M:%S')
+        delay = round(v.get('currentDelayMs', 0) / 60000)
+        print(f'{nid}: next={dt}, interval={delay}min')
+" 2>/dev/null || _get "cats"
+    ;;
+  *)
+    usage
+    ;;
+esac
