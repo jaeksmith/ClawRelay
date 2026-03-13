@@ -4,6 +4,7 @@ const admin = require('firebase-admin');
 const path = require('path');
 const cats = require('./cats');
 const location = require('./location');
+const weight = require('./weight');
 
 const WS_PORT = 18790;
 const HTTP_PORT = 18791;
@@ -73,6 +74,8 @@ wss.on('connection', (ws, req) => {
         ws.send(JSON.stringify(cats.getStateSnapshot()));
         // Send named locations to new client
         ws.send(JSON.stringify({ type: 'location_places', places: location.getNamedLocations() }));
+        // Send weight history to new client
+        ws.send(JSON.stringify({ type: 'weight_data', entries: weight.parseEntries() }));
 
       } else if (msg.type === 'cat_state_update') {
         // App changed a cat state — update server and broadcast to other clients
@@ -140,6 +143,12 @@ wss.on('connection', (ws, req) => {
         ws.send(JSON.stringify({ type: 'named_location_ack', ...result }));
         // Broadcast updated places list to all clients
         pushToClients({ action: 'location_places', places: location.getNamedLocations() });
+
+      } else if (msg.type === 'save_weight_entry') {
+        const result = weight.addEntry(msg.date, msg.weight, msg.notes || '');
+        ws.send(JSON.stringify({ type: 'weight_ack', ...result }));
+        // Broadcast updated weight data to all clients
+        pushToClients({ action: 'weight_data', entries: weight.parseEntries() });
 
       } else if (msg.type === 'pong') {
         // keepalive
@@ -399,6 +408,19 @@ app.post('/location/tracking', authCheck, (req, res) => {
   res.json({ tracking: location.isTracking() });
 });
 
+// --- Weight endpoints ---
+app.get('/weight/history', authCheck, (req, res) => {
+  res.json({ entries: weight.parseEntries() });
+});
+
+app.post('/weight/entry', authCheck, (req, res) => {
+  const { date, weight: w, notes } = req.body;
+  if (!date || w == null) return res.status(400).json({ error: 'date and weight required' });
+  const result = weight.addEntry(date, parseFloat(w), notes || '');
+  if (result.ok) pushToClients({ action: 'weight_data', entries: weight.parseEntries() });
+  res.json(result);
+});
+
 // --- SSE: real-time event stream for the web dashboard ---
 const sseClients = new Set();
 
@@ -551,6 +573,33 @@ function buildDashboardHtml(token) {
   <div class="card">
     <h2>🗺️ Known Places</h2>
     <div id="places-list">—</div>
+  </div>
+
+  <!-- Weight Graph -->
+  <div class="card" style="grid-column: 1 / -1" id="weight-card">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+      <h2 style="margin:0">⚖️ Weight</h2>
+      <div style="display:flex;gap:6px;align-items:center">
+        <button class="btn secondary" id="weight-range-btn" onclick="cycleWeightRange()" style="padding:4px 10px;font-size:0.75rem">year</button>
+        <button class="btn secondary" onclick="showWeightEntry()" style="padding:4px 10px;font-size:0.75rem">+ Log</button>
+      </div>
+    </div>
+    <canvas id="weight-canvas" height="110" style="width:100%;cursor:pointer" onclick="cycleWeightRange()"></canvas>
+    <div id="weight-latest" style="font-size:0.75rem;color:var(--muted);margin-top:6px">—</div>
+  </div>
+</div>
+
+<!-- Weight entry dialog -->
+<div id="weight-dialog" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:100;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border-radius:12px;padding:24px;min-width:280px;border:1px solid var(--border)">
+    <h3 style="margin-bottom:16px">Log Weight</h3>
+    <div id="weight-dialog-date" style="font-size:0.8rem;color:var(--muted);margin-bottom:8px"></div>
+    <input id="weight-input" class="input" type="number" step="0.1" placeholder="Weight (lbs)" style="margin-bottom:8px">
+    <input id="weight-notes-input" class="input" placeholder="Notes (optional)" style="margin-bottom:16px">
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn secondary" onclick="closeWeightDialog()">Cancel</button>
+      <button class="btn" onclick="saveWeightEntry()">Save</button>
+    </div>
   </div>
 </div>
 
@@ -748,9 +797,150 @@ function refreshPlaces() {
   api('GET', '/location/places').then(d => { state.places = d.places || []; render(); });
 }
 
+// ---- Weight graph ----
+let weightEntries = [];
+let weightRange = 'year'; // 'week' | 'month' | 'year'
+const WEIGHT_DAYS = { week: 7, month: 30, year: 365 };
+
+function loadWeight() {
+  api('GET', '/weight/history').then(d => {
+    weightEntries = d.entries || [];
+    renderWeight();
+  });
+}
+
+function cycleWeightRange() {
+  weightRange = weightRange === 'week' ? 'month' : weightRange === 'month' ? 'year' : 'week';
+  document.getElementById('weight-range-btn').textContent = weightRange;
+  renderWeight();
+}
+
+function renderWeight() {
+  const canvas = document.getElementById('weight-canvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = 110 * dpr;
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = 110;
+
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - WEIGHT_DAYS[weightRange]);
+  const filtered = weightEntries.filter(e => new Date(e.date) >= cutoff)
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  const latestEl = document.getElementById('weight-latest');
+  if (filtered.length === 0) {
+    ctx.fillStyle = '#888';
+    ctx.font = '13px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('No data for this period', W / 2, H / 2);
+    latestEl.textContent = weightEntries.length ? 'No entries in selected range' : 'No weight data yet — long-press graph in app to log';
+    return;
+  }
+
+  const padL = 42, padR = 8, padT = 8, padB = 20;
+  const gW = W - padL - padR, gH = H - padT - padB;
+  const weights = filtered.map(e => e.weight);
+  const minW = Math.floor(Math.min(...weights) - 2);
+  const maxW = Math.ceil(Math.max(...weights) + 2);
+  const rangeW = maxW - minW;
+
+  const xOf = i => padL + (i / Math.max(filtered.length - 1, 1)) * gW;
+  const yOf = w => padT + gH - ((w - minW) / rangeW) * gH;
+
+  // Grid lines + labels
+  ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+  ctx.lineWidth = 0.5;
+  ctx.fillStyle = '#888';
+  ctx.font = '9px sans-serif';
+  ctx.textAlign = 'right';
+  for (let i = 0; i <= 4; i++) {
+    const val = minW + (rangeW * i / 4);
+    const y = yOf(val);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+    ctx.fillText(Math.round(val), padL - 3, y + 3);
+  }
+
+  // Line
+  if (filtered.length > 1) {
+    ctx.beginPath();
+    ctx.strokeStyle = '#bb86fc';
+    ctx.lineWidth = 2.5;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    filtered.forEach((e, i) => {
+      i === 0 ? ctx.moveTo(xOf(i), yOf(e.weight)) : ctx.lineTo(xOf(i), yOf(e.weight));
+    });
+    ctx.stroke();
+  }
+
+  // Dots
+  const today = new Date().toISOString().slice(0, 10);
+  filtered.forEach((e, i) => {
+    const x = xOf(i), y = yOf(e.weight);
+    const isToday = e.date === today;
+    ctx.beginPath();
+    ctx.arc(x, y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = isToday ? '#4caf50' : '#bb86fc';
+    ctx.fill();
+    ctx.strokeStyle = '#121212'; ctx.lineWidth = 1.5;
+    ctx.stroke();
+  });
+
+  // X labels (first, mid, last)
+  ctx.fillStyle = '#888';
+  ctx.font = '8px sans-serif';
+  const labelIdxs = filtered.length <= 3 ? [...Array(filtered.length).keys()]
+    : [0, Math.floor(filtered.length / 2), filtered.length - 1];
+  labelIdxs.forEach(i => {
+    const d = new Date(filtered[i].date + 'T00:00:00');
+    const label = (d.getMonth() + 1) + '/' + d.getDate();
+    const x = xOf(i);
+    ctx.textAlign = i === 0 ? 'left' : i === filtered.length - 1 ? 'right' : 'center';
+    ctx.fillText(label, x, H - 2);
+  });
+
+  // Latest weight display
+  const last = filtered[filtered.length - 1];
+  latestEl.textContent = \`\${last.weight} lbs · \${last.date}\${last.notes ? ' · ' + last.notes : ''}\`;
+}
+
+function showWeightEntry() {
+  const today = new Date().toISOString().slice(0, 10);
+  const existing = weightEntries.find(e => e.date === today);
+  document.getElementById('weight-dialog-date').textContent = today;
+  document.getElementById('weight-input').value = existing ? existing.weight : '';
+  document.getElementById('weight-notes-input').value = existing?.notes || '';
+  const dlg = document.getElementById('weight-dialog');
+  dlg.style.display = 'flex';
+  setTimeout(() => document.getElementById('weight-input').focus(), 50);
+}
+
+function closeWeightDialog() {
+  document.getElementById('weight-dialog').style.display = 'none';
+}
+
+function saveWeightEntry() {
+  const today = new Date().toISOString().slice(0, 10);
+  const w = parseFloat(document.getElementById('weight-input').value);
+  const notes = document.getElementById('weight-notes-input').value.trim();
+  if (isNaN(w)) { alert('Enter a valid weight'); return; }
+  api('POST', '/weight/entry', { date: today, weight: w, notes })
+    .then(d => {
+      if (d.ok) {
+        closeWeightDialog();
+        loadWeight();
+      }
+    });
+}
+
 // Poll for updates every 10s as SSE backup + update timestamps
 setInterval(() => render(), 10000);
 
+loadWeight();
 connectSSE();
 </script>
 </body>
