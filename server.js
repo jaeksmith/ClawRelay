@@ -2,6 +2,7 @@ const express = require('express');
 const { WebSocketServer } = require('ws');
 const admin = require('firebase-admin');
 const path = require('path');
+const fs = require('fs');
 const cats = require('./cats');
 const location = require('./location');
 const weight = require('./weight');
@@ -419,6 +420,28 @@ app.post('/weight/entry', authCheck, (req, res) => {
   const result = weight.addEntry(date, parseFloat(w), notes || '');
   if (result.ok) pushToClients({ action: 'weight_data', entries: weight.parseEntries() });
   res.json(result);
+});
+
+// --- Task tracking endpoints (read-only) ---
+const TASKS_ACTIVE_PATH = '/home/claw/.openclaw/workspace/tasks/active.json';
+const TASKS_COMPLETED_PATH = '/home/claw/.openclaw/workspace/tasks/completed.json';
+
+app.get('/tasks', authCheck, (req, res) => {
+  try {
+    const tasks = JSON.parse(fs.readFileSync(TASKS_ACTIVE_PATH, 'utf8'));
+    res.json(tasks);
+  } catch (e) {
+    res.status(500).json({ error: 'Could not read task registry', detail: e.message });
+  }
+});
+
+app.get('/tasks/completed', authCheck, (req, res) => {
+  try {
+    const tasks = JSON.parse(fs.readFileSync(TASKS_COMPLETED_PATH, 'utf8'));
+    res.json(tasks);
+  } catch (e) {
+    res.json({ tasks: [] }); // completed.json may not exist yet — not an error
+  }
 });
 
 // --- SSE: real-time event stream for the web dashboard ---
