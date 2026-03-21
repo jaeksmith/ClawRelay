@@ -77,6 +77,12 @@ wss.on('connection', (ws, req) => {
         ws.send(JSON.stringify({ type: 'location_places', places: location.getNamedLocations() }));
         // Send weight history to new client
         ws.send(JSON.stringify({ type: 'weight_data', entries: weight.parseEntries() }));
+        // Send current task state to new client
+        ws.send(JSON.stringify({
+          type: 'command', action: 'task_update',
+          active: readTasksJson(TASKS_ACTIVE_PATH).tasks || [],
+          completed: (readTasksJson(TASKS_COMPLETED_PATH).tasks || []).slice(-20)
+        }));
 
       } else if (msg.type === 'cat_state_update') {
         // App changed a cat state — update server and broadcast to other clients
@@ -422,27 +428,55 @@ app.post('/weight/entry', authCheck, (req, res) => {
   res.json(result);
 });
 
-// --- Task tracking endpoints (read-only) ---
+// --- Task tracking: file-watch push, no client polling ---
 const TASKS_ACTIVE_PATH = '/home/claw/.openclaw/workspace/tasks/active.json';
 const TASKS_COMPLETED_PATH = '/home/claw/.openclaw/workspace/tasks/completed.json';
 
-app.get('/tasks', authCheck, (req, res) => {
-  try {
-    const tasks = JSON.parse(fs.readFileSync(TASKS_ACTIVE_PATH, 'utf8'));
-    res.json(tasks);
-  } catch (e) {
-    res.status(500).json({ error: 'Could not read task registry', detail: e.message });
-  }
-});
+function readTasksJson(filePath) {
+  try { return JSON.parse(fs.readFileSync(filePath, 'utf8')); }
+  catch (_) { return { tasks: [] }; }
+}
 
-app.get('/tasks/completed', authCheck, (req, res) => {
-  try {
-    const tasks = JSON.parse(fs.readFileSync(TASKS_COMPLETED_PATH, 'utf8'));
-    res.json(tasks);
-  } catch (e) {
-    res.json({ tasks: [] }); // completed.json may not exist yet — not an error
+function pushTaskUpdate() {
+  const active = readTasksJson(TASKS_ACTIVE_PATH);
+  const completed = readTasksJson(TASKS_COMPLETED_PATH);
+  const payload = {
+    action: 'task_update',
+    active: active.tasks || [],
+    completed: (completed.tasks || []).slice(-20) // last 20 only
+  };
+  pushToClients(payload);
+  broadcastSSE('task_update', payload);
+}
+
+// Watch both files; debounce 200ms so atomic writes don't double-fire
+let taskDebounce = null;
+function scheduleTaskPush() {
+  clearTimeout(taskDebounce);
+  taskDebounce = setTimeout(pushTaskUpdate, 200);
+}
+
+function watchTaskFile(filePath) {
+  // Create file if missing so watch doesn't fail
+  if (!fs.existsSync(filePath)) {
+    try { fs.writeFileSync(filePath, JSON.stringify({ tasks: [] }, null, 2)); } catch (_) {}
   }
-});
+  try {
+    fs.watch(filePath, (event) => {
+      if (event === 'change' || event === 'rename') scheduleTaskPush();
+    });
+    console.log(`[tasks] Watching ${filePath}`);
+  } catch (e) {
+    console.error(`[tasks] Could not watch ${filePath}:`, e.message);
+  }
+}
+
+watchTaskFile(TASKS_ACTIVE_PATH);
+watchTaskFile(TASKS_COMPLETED_PATH);
+
+// HTTP endpoints still available for initial fetch / debugging
+app.get('/tasks', authCheck, (req, res) => res.json(readTasksJson(TASKS_ACTIVE_PATH)));
+app.get('/tasks/completed', authCheck, (req, res) => res.json(readTasksJson(TASKS_COMPLETED_PATH)));
 
 // --- SSE: real-time event stream for the web dashboard ---
 const sseClients = new Set();
@@ -467,6 +501,10 @@ app.get('/events', authCheck, (req, res) => {
     location: location.getCurrent(),
     places: location.getNamedLocations(),
     clients: clients.size,
+    tasks: {
+      active: readTasksJson(TASKS_ACTIVE_PATH).tasks || [],
+      completed: (readTasksJson(TASKS_COMPLETED_PATH).tasks || []).slice(-20)
+    }
   })}\n\n`);
 
   req.on('close', () => sseClients.delete(res));
@@ -540,6 +578,22 @@ function buildDashboardHtml(token) {
 </head>
 <body>
 <h1>🦀 ClawApp <span id="conn-status">connecting...</span></h1>
+
+<!-- Task panel — always visible, push-updated -->
+<div id="task-panel" onclick="toggleTaskExpand()" style="
+  display:flex; align-items:center; justify-content:space-between;
+  background:var(--surface2); border:1px solid var(--border); border-radius:8px;
+  padding:7px 14px; margin-bottom:12px; cursor:pointer; user-select:none;
+">
+  <div style="display:flex;align-items:center;gap:10px">
+    <span>🗂</span>
+    <span id="task-chips" style="display:flex;gap:8px;font-size:0.8rem"></span>
+  </div>
+  <span style="font-size:0.72rem;color:var(--muted)">tasks ›</span>
+</div>
+<div id="task-expand" style="display:none;margin-bottom:12px">
+  <div id="task-list" style="display:flex;flex-direction:column;gap:8px"></div>
+</div>
 
 <div id="mute-banner" class="mute-banner" style="display:none">
   🔕 Muted until <span id="mute-until">—</span>
@@ -630,7 +684,7 @@ function buildDashboardHtml(token) {
 const TOKEN = '${token}';
 const BASE = window.location.origin;
 
-let state = { cats: {}, location: null, clients: 0, mute: null };
+let state = { cats: {}, location: null, clients: 0, mute: null, tasks: { active: [], completed: [] } };
 
 // SSE connection
 function connectSSE() {
@@ -650,6 +704,11 @@ function connectSSE() {
     if (d.clients !== undefined) state.clients = d.clients;
     render();
   });
+  es.addEventListener('task_update', e => {
+    const d = JSON.parse(e.data);
+    state.tasks = { active: d.active || [], completed: d.completed || [] };
+    renderTasks();
+  });
   es.onerror = () => {
     document.getElementById('conn-status').textContent = '● reconnecting...';
     document.getElementById('conn-status').style.color = '#f44336';
@@ -657,12 +716,14 @@ function connectSSE() {
 }
 
 function applyInit(d) {
-  if (d.cats?.cats) state.cats = d.cats.cats;         // snapshot key is .cats, not .state
+  if (d.cats?.cats) state.cats = d.cats.cats;
   if (d.cats?.mute) state.mute = d.cats.mute;
   state.location = d.location;
   state.places = d.places || [];
   state.clients = d.clients || 0;
+  if (d.tasks) state.tasks = d.tasks;
   render();
+  renderTasks();
 }
 
 const CAT_EMOJI = { Ty:'🖤', GentlemanMustachios:'🎩', Nocci:'🍊', Nommy:'🧡', Smoresy:'💜', Cay:'🐾' };
@@ -960,8 +1021,82 @@ function saveWeightEntry() {
     });
 }
 
-// Poll for updates every 10s as SSE backup + update timestamps
-setInterval(() => render(), 10000);
+// Refresh display every 10s — updates timestamps and client-side stall detection
+setInterval(() => { render(); renderTasks(); }, 10000);
+
+let taskExpanded = false;
+function toggleTaskExpand() {
+  taskExpanded = !taskExpanded;
+  document.getElementById('task-expand').style.display = taskExpanded ? 'block' : 'none';
+}
+
+function renderTasks() {
+  const tasks = state.tasks || { active: [], completed: [] };
+  const all = [...(tasks.active || []), ...(tasks.completed || [])];
+
+  // Compute counts with client-side stall detection
+  const now = Math.floor(Date.now() / 1000);
+  const effectiveStatus = t => (t.status === 'running' && t.timeoutAt && now > t.timeoutAt) ? 'stalled' : t.status;
+
+  const counts = { running: 0, stalled: 0, complete: 0, failed: 0 };
+  all.forEach(t => { const s = effectiveStatus(t); if (counts[s] !== undefined) counts[s]++; });
+
+  // Chips
+  const chips = [];
+  if (counts.running)  chips.push(\`<span style="color:#4caf50;font-weight:600">⚡ \${counts.running}</span>\`);
+  if (counts.stalled)  chips.push(\`<span style="color:#ffc107;font-weight:600">⚠️ \${counts.stalled}</span>\`);
+  if (counts.failed)   chips.push(\`<span style="color:#f44336;font-weight:600">❌ \${counts.failed}</span>\`);
+  if (counts.complete) chips.push(\`<span style="color:var(--muted)">✅ \${counts.complete}</span>\`);
+  if (chips.length === 0) chips.push(\`<span style="color:var(--muted)">no tasks</span>\`);
+
+  document.getElementById('task-chips').innerHTML = chips.join('');
+
+  // Update panel background
+  const panel = document.getElementById('task-panel');
+  panel.style.background = counts.stalled || counts.failed
+    ? 'rgba(244,67,54,0.12)' : counts.running
+    ? 'rgba(187,134,252,0.10)' : 'var(--surface2)';
+  panel.style.borderColor = counts.stalled || counts.failed
+    ? 'rgba(244,67,54,0.4)' : counts.running
+    ? 'rgba(187,134,252,0.35)' : 'var(--border)';
+
+  // Expanded task list
+  if (!taskExpanded) return;
+  const listEl = document.getElementById('task-list');
+  if (all.length === 0) { listEl.innerHTML = '<div style="color:var(--muted);font-size:0.85rem">No tasks</div>'; return; }
+
+  const fmt = ts => ts ? new Date(ts * 1000).toLocaleString([], {month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
+  const active = (tasks.active || []).slice().sort((a,b) => b.spawnedAt - a.spawnedAt);
+  const recent = (tasks.completed || []).slice(-10).reverse();
+
+  const renderCard = (t, dimmed) => {
+    const st = effectiveStatus(t);
+    const colors = { running:'#4caf50', stalled:'#ffc107', complete:'var(--muted)', failed:'#f44336' };
+    const emojis = { running:'⚡', stalled:'⚠️', complete:'✅', failed:'❌' };
+    const remaining = st === 'running' && t.timeoutAt ? t.timeoutAt - now : null;
+    return \`<div style="background:var(--surface2);border-radius:8px;padding:10px 12px;opacity:\${dimmed?0.6:1}">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+        <span style="font-weight:600;font-size:0.85rem">\${emojis[st]||'❓'} \${t.label}</span>
+        <span style="font-size:0.7rem;font-weight:700;color:\${colors[st]||'var(--muted)'}">\${st.toUpperCase()}</span>
+      </div>
+      \${t.description ? \`<div style="font-size:0.75rem;color:var(--muted);margin-bottom:3px">\${t.description}</div>\` : ''}
+      \${t.notes ? \`<div style="font-size:0.7rem;font-family:monospace;color:var(--muted);opacity:0.8">\${t.notes}</div>\` : ''}
+      <div style="display:flex;gap:10px;margin-top:5px;font-size:0.7rem;color:var(--muted)">
+        <span>type:\${t.type}</span>
+        <span>spawned:\${fmt(t.spawnedAt)}</span>
+        \${remaining !== null && remaining > 0 ? \`<span style="color:\${remaining<300?'#ffc107':'var(--muted)'}">timeout:\${Math.floor(remaining/60)}m</span>\` : ''}
+      </div>
+    </div>\`;
+  };
+
+  let html = '';
+  if (active.length) html += active.map(t => renderCard(t, false)).join('');
+  if (recent.length) {
+    if (active.length) html += '<div style="font-size:0.7rem;color:var(--muted);margin-top:8px;letter-spacing:0.05em">RECENT</div>';
+    html += recent.map(t => renderCard(t, true)).join('');
+  }
+  listEl.innerHTML = html;
+}
 
 loadWeight();
 connectSSE();
