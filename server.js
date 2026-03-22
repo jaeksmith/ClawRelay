@@ -1056,8 +1056,9 @@ function renderTasks() {
   const now = Math.floor(Date.now() / 1000);
   // Active tasks: detect stall by timeout. Completed tasks: running→failed (abandoned), never stalled.
   const effectiveStatus = (t, isCompleted) => {
-    if (isCompleted) return t.status === 'running' ? 'failed' : t.status;
-    return (t.status === 'running' && t.timeoutAt && now > t.timeoutAt) ? 'stalled' : t.status;
+    const s = t.status === 'success' ? 'complete' : t.status; // normalise legacy status
+    if (isCompleted) return s === 'running' ? 'failed' : s;
+    return (s === 'running' && t.timeoutAt && now > t.timeoutAt) ? 'stalled' : s;
   };
 
   const counts = { running: 0, stalled: 0, complete: 0, failed: 0 };
