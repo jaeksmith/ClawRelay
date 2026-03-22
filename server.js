@@ -1043,9 +1043,18 @@ function saveWeightEntry() {
 setInterval(() => { render(); renderTasks(); }, 10000);
 
 let taskExpanded = false;
+const expandedTasks = new Set(); // task ids currently expanded
+
 function toggleTaskExpand() {
   taskExpanded = !taskExpanded;
   document.getElementById('task-expand').style.display = taskExpanded ? 'block' : 'none';
+  if (taskExpanded) renderTaskList();
+}
+
+function toggleTask(id) {
+  if (expandedTasks.has(id)) expandedTasks.delete(id);
+  else expandedTasks.add(id);
+  renderTaskList();
 }
 
 function renderTasks() {
@@ -1084,41 +1093,74 @@ function renderTasks() {
     ? 'rgba(244,67,54,0.4)' : counts.running
     ? 'rgba(187,134,252,0.35)' : 'var(--border)';
 
-  // Expanded task list
+}
+
+function renderTaskList() {
   if (!taskExpanded) return;
+  const tasks = state.tasks || { active: [], completed: [] };
   const listEl = document.getElementById('task-list');
-  if (all.length === 0) { listEl.innerHTML = '<div style="color:var(--muted);font-size:0.85rem">No tasks</div>'; return; }
+  const now = Math.floor(Date.now() / 1000);
 
-  const fmt = ts => ts ? new Date(ts * 1000).toLocaleString([], {month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
-  const active = (tasks.active || []).slice().sort((a,b) => b.spawnedAt - a.spawnedAt);
-  const recent = (tasks.completed || []).slice(-10).reverse();
-
-  const renderCard = (t, dimmed) => {
-    const st = effectiveStatus(t, dimmed);
-    const colors = { running:'#4caf50', stalled:'#ffc107', complete:'var(--muted)', failed:'#f44336' };
-    const emojis = { running:'⚡', stalled:'⚠️', complete:'✅', failed:'❌' };
-    const remaining = st === 'running' && t.timeoutAt ? t.timeoutAt - now : null;
-    return \`<div style="background:var(--surface2);border-radius:8px;padding:10px 12px;opacity:\${dimmed?0.6:1}">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
-        <span style="font-weight:600;font-size:0.85rem">\${emojis[st]||'❓'} \${t.label}</span>
-        <span style="font-size:0.7rem;font-weight:700;color:\${colors[st]||'var(--muted)'}">\${st.toUpperCase()}</span>
-      </div>
-      \${t.description ? \`<div style="font-size:0.75rem;color:var(--muted);margin-bottom:3px">\${t.description}</div>\` : ''}
-      \${t.notes ? \`<div style="font-size:0.7rem;font-family:monospace;color:var(--muted);opacity:0.8">\${t.notes}</div>\` : ''}
-      <div style="display:flex;gap:10px;margin-top:5px;font-size:0.7rem;color:var(--muted)">
-        <span>type:\${t.type}</span>
-        <span>spawned:\${fmt(t.spawnedAt)}</span>
-        \${remaining !== null && remaining > 0 ? \`<span style="color:\${remaining<300?'#ffc107':'var(--muted)'}">timeout:\${Math.floor(remaining/60)}m</span>\` : ''}
-      </div>
-    </div>\`;
+  const effectiveStatus = (t, isCompleted) => {
+    const s = t.status === 'success' ? 'complete' : t.status;
+    if (isCompleted) return s === 'running' ? 'failed' : s;
+    return (s === 'running' && t.timeoutAt && now > t.timeoutAt) ? 'stalled' : s;
   };
 
-  let html = '';
-  if (active.length) html += active.map(t => renderCard(t, false)).join('');
-  if (recent.length) {
-    if (active.length) html += '<div style="font-size:0.7rem;color:var(--muted);margin-top:8px;letter-spacing:0.05em">RECENT</div>';
-    html += recent.map(t => renderCard(t, true)).join('');
+  const active = (tasks.active || []).slice().sort((a,b) => b.spawnedAt - a.spawnedAt);
+  const recent = (tasks.completed || []).slice(-10).reverse();
+  const all = [...active.map(t=>({t,isCompleted:false})), ...recent.map(t=>({t,isCompleted:true}))];
+
+  if (all.length === 0) {
+    listEl.innerHTML = '<div style="color:var(--muted);font-size:0.85rem;padding:4px 0">No tasks</div>';
+    return;
   }
+
+  const fmt = ts => ts ? new Date(ts * 1000).toLocaleString([], {month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
+  const colors = { running:'#4caf50', stalled:'#ffc107', complete:'var(--muted)', failed:'#f44336' };
+  const emojis = { running:'⚡', stalled:'⚠️', complete:'✅', failed:'❌' };
+
+  let html = '';
+  let lastSection = null;
+
+  all.forEach(({t, isCompleted}) => {
+    const section = isCompleted ? 'RECENT' : 'ACTIVE';
+    if (section !== lastSection && active.length && recent.length) {
+      if (lastSection !== null)
+        html += '<div style="font-size:0.7rem;color:var(--muted);margin-top:6px;margin-bottom:2px;letter-spacing:0.05em">RECENT</div>';
+      lastSection = section;
+    }
+
+    const st = effectiveStatus(t, isCompleted);
+    const open = expandedTasks.has(t.id);
+    const remaining = st === 'running' && t.timeoutAt ? t.timeoutAt - now : null;
+    const safeId = t.id.replace(/[^a-z0-9-]/gi, '');
+
+    html += \`<div style="background:var(--surface2);border-radius:8px;overflow:hidden;opacity:\${isCompleted?0.65:1}">
+      <div onclick="toggleTask('\${safeId}')" style="
+        display:flex;justify-content:space-between;align-items:center;
+        padding:8px 12px;cursor:pointer;user-select:none;
+      ">
+        <span style="font-weight:600;font-size:0.82rem;display:flex;align-items:center;gap:6px">
+          \${emojis[st]||'❓'} \${t.label}
+        </span>
+        <span style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:0.68rem;font-weight:700;color:\${colors[st]||'var(--muted)'}">\${st.toUpperCase()}</span>
+          <span style="color:var(--muted);font-size:0.8rem">\${open ? '▾' : '▸'}</span>
+        </span>
+      </div>
+      \${open ? \`<div style="padding:0 12px 10px;border-top:1px solid rgba(255,255,255,0.06)">
+        \${t.description ? \`<div style="font-size:0.75rem;color:var(--muted);margin-top:6px;margin-bottom:3px">\${t.description}</div>\` : ''}
+        \${t.notes ? \`<div style="font-size:0.7rem;font-family:monospace;color:var(--muted);opacity:0.8;margin-bottom:4px">\${t.notes}</div>\` : ''}
+        <div style="display:flex;gap:10px;font-size:0.68rem;color:var(--muted);margin-top:4px">
+          <span>type:\${t.type}</span>
+          <span>spawned:\${fmt(t.spawnedAt)}</span>
+          \${remaining !== null && remaining > 0 ? \`<span style="color:\${remaining<300?'#ffc107':'var(--muted)'}">timeout:\${Math.floor(remaining/60)}m</span>\` : ''}
+        </div>
+      </div>\` : ''}
+    </div>\`;
+  });
+
   listEl.innerHTML = html;
 }
 
