@@ -1048,7 +1048,7 @@ const expandedTasks = new Set(); // task ids currently expanded
 function toggleTaskExpand() {
   taskExpanded = !taskExpanded;
   document.getElementById('task-expand').style.display = taskExpanded ? 'block' : 'none';
-  if (taskExpanded) renderTaskList();
+  renderTaskList(); // populate immediately on open; no-op when closing (guard inside)
 }
 
 function toggleTask(id) {
@@ -1093,6 +1093,7 @@ function renderTasks() {
     ? 'rgba(244,67,54,0.4)' : counts.running
     ? 'rgba(187,134,252,0.35)' : 'var(--border)';
 
+  renderTaskList();
 }
 
 function renderTaskList() {
