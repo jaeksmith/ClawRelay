@@ -1054,10 +1054,15 @@ function renderTasks() {
 
   // Compute counts with client-side stall detection
   const now = Math.floor(Date.now() / 1000);
-  const effectiveStatus = t => (t.status === 'running' && t.timeoutAt && now > t.timeoutAt) ? 'stalled' : t.status;
+  // Active tasks: detect stall by timeout. Completed tasks: running→failed (abandoned), never stalled.
+  const effectiveStatus = (t, isCompleted) => {
+    if (isCompleted) return t.status === 'running' ? 'failed' : t.status;
+    return (t.status === 'running' && t.timeoutAt && now > t.timeoutAt) ? 'stalled' : t.status;
+  };
 
   const counts = { running: 0, stalled: 0, complete: 0, failed: 0 };
-  all.forEach(t => { const s = effectiveStatus(t); if (counts[s] !== undefined) counts[s]++; });
+  (tasks.active || []).forEach(t => { const s = effectiveStatus(t, false); if (s in counts) counts[s]++; });
+  (tasks.completed || []).forEach(t => { const s = effectiveStatus(t, true); if (s in counts) counts[s]++; });
 
   // Chips
   const chips = [];
@@ -1088,7 +1093,7 @@ function renderTasks() {
   const recent = (tasks.completed || []).slice(-10).reverse();
 
   const renderCard = (t, dimmed) => {
-    const st = effectiveStatus(t);
+    const st = effectiveStatus(t, dimmed);
     const colors = { running:'#4caf50', stalled:'#ffc107', complete:'var(--muted)', failed:'#f44336' };
     const emojis = { running:'⚡', stalled:'⚠️', complete:'✅', failed:'❌' };
     const remaining = st === 'running' && t.timeoutAt ? t.timeoutAt - now : null;
