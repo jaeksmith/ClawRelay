@@ -1122,6 +1122,18 @@ function renderTasks() {
   listEl.innerHTML = html;
 }
 
+// Prefetch tasks immediately on load so panel shows without waiting for SSE init
+Promise.all([
+  api('GET', '/tasks'),
+  api('GET', '/tasks/completed')
+]).then(([active, completed]) => {
+  state.tasks = {
+    active: active.tasks || [],
+    completed: (completed.tasks || []).slice(-20)
+  };
+  renderTasks();
+}).catch(() => {});
+
 loadWeight();
 connectSSE();
 </script>
