@@ -38,13 +38,18 @@ function pushToClients(payload, targetId = null) {
     }
   }
   // Mirror to SSE dashboard clients
-  const isCatAction = payload.action?.startsWith('cat') || payload.action === 'mute_state';
-  broadcastSSE('update', {
-    action: payload.action,
-    cats: isCatAction ? cats.getStateSnapshot() : undefined,
-    location: payload.action === 'location_update' ? location.getCurrent() : undefined,
-    clients: clients.size,
-  });
+  if (payload.action === 'task_update') {
+    // Task updates get their own SSE event type so the dashboard can handle them directly
+    broadcastSSE('task_update', { active: payload.active, completed: payload.completed });
+  } else {
+    const isCatAction = payload.action?.startsWith('cat') || payload.action === 'mute_state';
+    broadcastSSE('update', {
+      action: payload.action,
+      cats: isCatAction ? cats.getStateSnapshot() : undefined,
+      location: payload.action === 'location_update' ? location.getCurrent() : undefined,
+      clients: clients.size,
+    });
+  }
 }
 
 // Init cats module with push function
@@ -461,14 +466,27 @@ function watchTaskFile(filePath) {
   if (!fs.existsSync(filePath)) {
     try { fs.writeFileSync(filePath, JSON.stringify({ tasks: [] }, null, 2)); } catch (_) {}
   }
-  try {
-    fs.watch(filePath, (event) => {
-      if (event === 'change' || event === 'rename') scheduleTaskPush();
-    });
-    console.log(`[tasks] Watching ${filePath}`);
-  } catch (e) {
-    console.error(`[tasks] Could not watch ${filePath}:`, e.message);
+
+  let watcher = null;
+
+  function attach() {
+    try {
+      watcher = fs.watch(filePath, (event) => {
+        scheduleTaskPush();
+        // On rename (atomic mv), inotify watch dies — re-attach after short delay
+        if (event === 'rename') {
+          watcher = null;
+          setTimeout(attach, 200);
+        }
+      });
+    } catch (e) {
+      // File may not exist yet (e.g. completed.json before first completion) — retry
+      setTimeout(attach, 2000);
+    }
   }
+
+  attach();
+  console.log(`[tasks] Watching ${filePath}`);
 }
 
 watchTaskFile(TASKS_ACTIVE_PATH);
@@ -586,7 +604,7 @@ function buildDashboardHtml(token) {
   padding:7px 14px; margin-bottom:12px; cursor:pointer; user-select:none;
 ">
   <div style="display:flex;align-items:center;gap:10px">
-    <span>🗂</span>
+    <span style="font-size:0.8rem;color:var(--muted)">TASKS</span>
     <span id="task-chips" style="display:flex;gap:8px;font-size:0.8rem"></span>
   </div>
   <span style="font-size:0.72rem;color:var(--muted)">tasks ›</span>
