@@ -748,7 +748,7 @@ function applyInit(d) {
 
 const CAT_EMOJI = { Ty:'🖤', GentlemanMustachios:'🎩', Nocci:'🍊', Nommy:'🧡', Smoresy:'💜', Cay:'🐾' };
 const CAT_IMG = name => {
-  const key = name.toLowerCase().replace(/\s+/g,'');
+  const key = name.toLowerCase().replace(/\\s+/g,'');
   return \`/public/cats/cat_\${key}.jpg\`;
 };
 
