@@ -282,6 +282,7 @@ async function deliverCommand(commandData) {
 // --- HTTP API ---
 const app = express();
 app.use(express.json());
+app.use('/public', express.static(path.join(__dirname, 'public')));
 
 function authCheck(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '') || req.query.token;
@@ -567,13 +568,14 @@ function buildDashboardHtml(token) {
   .dot.gray { background: var(--muted); }
   .dot.yellow { background: var(--yellow); }
   .cat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 8px; }
-  .cat-tile { background: var(--surface2); border-radius: 8px; padding: 10px 8px; text-align: center; border: 2px solid transparent; transition: border-color 0.2s; }
+  .cat-tile { background: var(--surface2); border-radius: 8px; padding: 8px 6px; text-align: center; border: 2px solid transparent; transition: border-color 0.2s; }
   .cat-tile.outside { border-color: var(--yellow); }
   .cat-tile.inside { border-color: var(--green); }
   .cat-tile.unknown { border-color: var(--muted); }
-  .cat-name { font-size: 0.8rem; font-weight: 600; margin-top: 4px; }
+  .cat-name { font-size: 0.8rem; font-weight: 600; margin-top: 5px; }
   .cat-state { font-size: 0.65rem; color: var(--muted); margin-top: 2px; }
-  .cat-emoji { font-size: 1.6rem; }
+  .cat-img { width: 64px; height: 64px; border-radius: 50%; object-fit: cover; display: block; margin: 0 auto; }
+  .cat-img-placeholder { font-size: 1.6rem; line-height: 64px; }
   .state-btn { background: var(--surface); border: 1px solid var(--border); color: var(--muted); border-radius: 4px; padding: 2px 7px; font-size: 0.65rem; cursor: pointer; transition: all 0.15s; }
   .state-btn:hover { border-color: var(--primary); color: var(--text); }
   .state-btn.active-btn { background: var(--primary); color: #000; border-color: var(--primary); font-weight: 700; }
@@ -745,6 +747,10 @@ function applyInit(d) {
 }
 
 const CAT_EMOJI = { Ty:'🖤', GentlemanMustachios:'🎩', Nocci:'🍊', Nommy:'🧡', Smoresy:'💜', Cay:'🐾' };
+const CAT_IMG = name => {
+  const key = name.toLowerCase().replace(/\s+/g,'');
+  return \`/public/cats/cat_\${key}.jpg\`;
+};
 
 function render() {
   // Cats
@@ -758,8 +764,11 @@ function render() {
       const ago = cat.stateSetAt ? timeAgo(cat.stateSetAt) : '';
       const safeName = name.replace(/'/g, "\\'");
       const isOutdoorOnly = cat.outdoorOnly;
+      const imgSrc = CAT_IMG(name);
       return \`<div class="cat-tile \${st}">
-        <div class="cat-emoji">\${emoji}</div>
+        <img class="cat-img" src="\${imgSrc}" alt="\${name}"
+          onerror="this.style.display='none';this.nextElementSibling.style.display='block'">
+        <div class="cat-img-placeholder" style="display:none">\${emoji}</div>
         <div class="cat-name">\${name}</div>
         <div class="cat-state">\${st}\${ago ? ' · '+ago : ''}</div>
         \${!isOutdoorOnly ? \`<div style="display:flex;gap:4px;margin-top:6px;justify-content:center">
