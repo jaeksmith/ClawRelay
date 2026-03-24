@@ -950,10 +950,17 @@ function renderWeight() {
   const maxW = Math.ceil(Math.max(...weights) + 2);
   const rangeW = maxW - minW;
 
-  const xOf = i => padL + (i / Math.max(filtered.length - 1, 1)) * gW;
+  // Time-axis: x proportional to date within [cutoff, today]
+  const today = new Date(); today.setHours(0,0,0,0);
+  const axisStartMs = cutoff.getTime();
+  const axisRangeMs = today.getTime() - axisStartMs || 1;
+  const xOfDate = dateStr => {
+    const d = new Date(dateStr + 'T00:00:00'); 
+    return padL + ((d.getTime() - axisStartMs) / axisRangeMs) * gW;
+  };
   const yOf = w => padT + gH - ((w - minW) / rangeW) * gH;
 
-  // Grid lines + labels
+  // Grid lines + Y labels
   ctx.strokeStyle = 'rgba(255,255,255,0.07)';
   ctx.lineWidth = 0.5;
   ctx.fillStyle = '#888';
@@ -966,7 +973,7 @@ function renderWeight() {
     ctx.fillText(Math.round(val), padL - 3, y + 3);
   }
 
-  // Line
+  // Line — gaps where data is missing are visually apparent
   if (filtered.length > 1) {
     ctx.beginPath();
     ctx.strokeStyle = '#bb86fc';
@@ -974,16 +981,16 @@ function renderWeight() {
     ctx.lineJoin = 'round';
     ctx.lineCap = 'round';
     filtered.forEach((e, i) => {
-      i === 0 ? ctx.moveTo(xOf(i), yOf(e.weight)) : ctx.lineTo(xOf(i), yOf(e.weight));
+      i === 0 ? ctx.moveTo(xOfDate(e.date), yOf(e.weight)) : ctx.lineTo(xOfDate(e.date), yOf(e.weight));
     });
     ctx.stroke();
   }
 
   // Dots
-  const today = new Date().toISOString().slice(0, 10);
-  filtered.forEach((e, i) => {
-    const x = xOf(i), y = yOf(e.weight);
-    const isToday = e.date === today;
+  const todayStr = today.toISOString().slice(0, 10);
+  filtered.forEach(e => {
+    const x = xOfDate(e.date), y = yOf(e.weight);
+    const isToday = e.date === todayStr;
     ctx.beginPath();
     ctx.arc(x, y, 4, 0, Math.PI * 2);
     ctx.fillStyle = isToday ? '#4caf50' : '#bb86fc';
@@ -992,16 +999,18 @@ function renderWeight() {
     ctx.stroke();
   });
 
-  // X labels (first, mid, last)
+  // X labels: start, mid, end of the time window (fixed axis dates, not entry positions)
   ctx.fillStyle = '#888';
   ctx.font = '8px sans-serif';
-  const labelIdxs = filtered.length <= 3 ? [...Array(filtered.length).keys()]
-    : [0, Math.floor(filtered.length / 2), filtered.length - 1];
-  labelIdxs.forEach(i => {
-    const d = new Date(filtered[i].date + 'T00:00:00');
+  const midDate = new Date(axisStartMs + axisRangeMs / 2);
+  [
+    { d: cutoff,  align: 'left' },
+    { d: midDate, align: 'center' },
+    { d: today,   align: 'right' }
+  ].forEach(({ d, align }) => {
     const label = (d.getMonth() + 1) + '/' + d.getDate();
-    const x = xOf(i);
-    ctx.textAlign = i === 0 ? 'left' : i === filtered.length - 1 ? 'right' : 'center';
+    const x = padL + ((d.getTime() - axisStartMs) / axisRangeMs) * gW;
+    ctx.textAlign = align;
     ctx.fillText(label, x, H - 2);
   });
 
