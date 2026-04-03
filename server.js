@@ -677,7 +677,7 @@ function buildDashboardHtml(token) {
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
       <h2 style="margin:0">⚖️ Weight</h2>
       <div style="display:flex;gap:6px;align-items:center">
-        <button class="btn secondary" id="weight-range-btn" onclick="cycleWeightRange()" style="padding:4px 10px;font-size:0.75rem">year</button>
+        <button class="btn secondary" id="weight-range-btn" onclick="cycleWeightRange()" style="padding:4px 10px;font-size:0.75rem">month</button>
         <button class="btn secondary" onclick="showWeightEntry()" style="padding:4px 10px;font-size:0.75rem">+ Log</button>
       </div>
     </div>
@@ -910,7 +910,7 @@ function refreshPlaces() {
 
 // ---- Weight graph ----
 let weightEntries = [];
-let weightRange = 'year'; // 'week' | 'month' | 'year'
+let weightRange = 'month'; // 'week' | 'month' | 'year'
 const WEIGHT_DAYS = { week: 7, month: 30, year: 365 };
 
 function loadWeight() {
