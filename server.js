@@ -6,6 +6,7 @@ const fs = require('fs');
 const cats = require('./cats');
 const location = require('./location');
 const weight = require('./weight');
+const health = require('./health');
 
 const WS_PORT = 18790;
 const HTTP_PORT = 18791;
@@ -41,6 +42,8 @@ function pushToClients(payload, targetId = null) {
   if (payload.action === 'task_update') {
     // Task updates get their own SSE event type so the dashboard can handle them directly
     broadcastSSE('task_update', { active: payload.active, completed: payload.completed });
+  } else if (payload.action === 'health_data') {
+    broadcastSSE('health_data', { heartRate: payload.heartRate, bloodPressure: payload.bloodPressure });
   } else {
     const isCatAction = payload.action?.startsWith('cat') || payload.action === 'mute_state';
     broadcastSSE('update', {
@@ -82,6 +85,8 @@ wss.on('connection', (ws, req) => {
         ws.send(JSON.stringify({ type: 'location_places', places: location.getNamedLocations() }));
         // Send weight history to new client
         ws.send(JSON.stringify({ type: 'weight_data', entries: weight.parseEntries() }));
+        // Send health data to new client
+        ws.send(JSON.stringify({ type: 'health_data', heartRate: health.parseHeartRate(), bloodPressure: health.parseBloodPressure() }));
         // Send current task state to new client
         ws.send(JSON.stringify({
           type: 'command', action: 'task_update',
@@ -161,6 +166,16 @@ wss.on('connection', (ws, req) => {
         ws.send(JSON.stringify({ type: 'weight_ack', ...result }));
         // Broadcast updated weight data to all clients
         pushToClients({ action: 'weight_data', entries: weight.parseEntries() });
+
+      } else if (msg.type === 'save_heart_rate') {
+        const result = health.addHeartRate(msg.date, msg.bpm);
+        ws.send(JSON.stringify({ type: 'health_ack', ...result }));
+        pushToClients({ action: 'health_data', heartRate: health.parseHeartRate(), bloodPressure: health.parseBloodPressure() });
+
+      } else if (msg.type === 'save_blood_pressure') {
+        const result = health.addBloodPressure(msg.date, msg.systolic, msg.diastolic);
+        ws.send(JSON.stringify({ type: 'health_ack', ...result }));
+        pushToClients({ action: 'health_data', heartRate: health.parseHeartRate(), bloodPressure: health.parseBloodPressure() });
 
       } else if (msg.type === 'pong') {
         // keepalive
@@ -434,6 +449,31 @@ app.post('/weight/entry', authCheck, (req, res) => {
   res.json(result);
 });
 
+// --- Health endpoints ---
+app.get('/health/heart-rate', authCheck, (req, res) => {
+  res.json({ entries: health.parseHeartRate() });
+});
+
+app.post('/health/heart-rate', authCheck, (req, res) => {
+  const { date, bpm } = req.body;
+  if (!date || bpm == null) return res.status(400).json({ error: 'date and bpm required' });
+  const result = health.addHeartRate(date, parseInt(bpm, 10));
+  if (result.ok) pushToClients({ action: 'health_data', heartRate: health.parseHeartRate(), bloodPressure: health.parseBloodPressure() });
+  res.json(result);
+});
+
+app.get('/health/blood-pressure', authCheck, (req, res) => {
+  res.json({ entries: health.parseBloodPressure() });
+});
+
+app.post('/health/blood-pressure', authCheck, (req, res) => {
+  const { date, systolic, diastolic } = req.body;
+  if (!date || systolic == null || diastolic == null) return res.status(400).json({ error: 'date, systolic, and diastolic required' });
+  const result = health.addBloodPressure(date, parseInt(systolic, 10), parseInt(diastolic, 10));
+  if (result.ok) pushToClients({ action: 'health_data', heartRate: health.parseHeartRate(), bloodPressure: health.parseBloodPressure() });
+  res.json(result);
+});
+
 // --- Task tracking: file-watch push, no client polling ---
 const TASKS_ACTIVE_PATH = '/home/claw/.openclaw/workspace/tasks/active.json';
 const TASKS_COMPLETED_PATH = '/home/claw/.openclaw/workspace/tasks/completed.json';
@@ -523,7 +563,9 @@ app.get('/events', authCheck, (req, res) => {
     tasks: {
       active: readTasksJson(TASKS_ACTIVE_PATH).tasks || [],
       completed: (readTasksJson(TASKS_COMPLETED_PATH).tasks || []).slice(-20)
-    }
+    },
+    heartRate: health.parseHeartRate(),
+    bloodPressure: health.parseBloodPressure()
   })}\n\n`);
 
   req.on('close', () => sseClients.delete(res));
@@ -672,30 +714,55 @@ function buildDashboardHtml(token) {
     <div id="places-list">—</div>
   </div>
 
-  <!-- Weight Graph -->
-  <div class="card" style="grid-column: 1 / -1" id="weight-card">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-      <h2 style="margin:0">⚖️ Weight</h2>
-      <div style="display:flex;gap:6px;align-items:center">
-        <button class="btn secondary" id="weight-range-btn" onclick="cycleWeightRange()" style="padding:4px 10px;font-size:0.75rem">month</button>
-        <button class="btn secondary" onclick="showWeightEntry()" style="padding:4px 10px;font-size:0.75rem">+ Log</button>
+  <!-- Health Card -->
+  <div class="card" style="grid-column: 1 / -1" id="health-card">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px">
+      <h2 style="margin:0">🏥 Health</h2>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <button class="btn secondary" id="hshow-weight" onclick="toggleHealthSeries('weight')" style="padding:3px 8px;font-size:0.75rem">⚖️ Weight</button>
+        <button class="btn secondary" id="hshow-heart" onclick="toggleHealthSeries('heart')" style="padding:3px 8px;font-size:0.75rem">❤️ Heart</button>
+        <button class="btn secondary" id="hshow-bp" onclick="toggleHealthSeries('bp')" style="padding:3px 8px;font-size:0.75rem">🩺 BP</button>
+        <button class="btn secondary" id="health-range-btn" onclick="cycleHealthRange()" style="padding:3px 8px;font-size:0.75rem">month</button>
+        <button class="btn secondary" onclick="showHealthLog()" style="padding:3px 8px;font-size:0.75rem">+ Log</button>
+        <button class="btn secondary" onclick="toggleHealthDetail()" style="padding:3px 8px;font-size:0.75rem" id="health-detail-btn">detail ▸</button>
       </div>
     </div>
-    <canvas id="weight-canvas" height="110" style="width:100%;cursor:pointer" onclick="cycleWeightRange()"></canvas>
-    <div id="weight-latest" style="font-size:0.75rem;color:var(--muted);margin-top:6px">—</div>
+    <canvas id="health-mini-canvas" height="120" style="width:100%;cursor:pointer" onclick="cycleHealthRange()"></canvas>
+    <div id="health-latest" style="font-size:0.75rem;color:var(--muted);margin-top:6px">—</div>
+    <div id="health-detail" style="display:none;margin-top:12px">
+      <div style="font-size:0.75rem;color:var(--muted);margin-bottom:4px">⚖️ Weight (lbs)</div>
+      <canvas id="health-weight-canvas" height="100" style="width:100%"></canvas>
+      <div style="font-size:0.75rem;color:var(--muted);margin:8px 0 4px">❤️ Heart Rate (BPM)</div>
+      <canvas id="health-heart-canvas" height="100" style="width:100%"></canvas>
+      <div style="font-size:0.75rem;color:var(--muted);margin:8px 0 4px">🩺 Blood Pressure <span style="color:#2196f3">■</span> Systolic <span style="color:#00bcd4">■</span> Diastolic</div>
+      <canvas id="health-bp-canvas" height="100" style="width:100%"></canvas>
+    </div>
   </div>
 </div>
 
-<!-- Weight entry dialog -->
-<div id="weight-dialog" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:100;align-items:center;justify-content:center">
-  <div style="background:var(--surface);border-radius:12px;padding:24px;min-width:280px;border:1px solid var(--border)">
-    <h3 style="margin-bottom:16px">Log Weight</h3>
-    <div id="weight-dialog-date" style="font-size:0.8rem;color:var(--muted);margin-bottom:8px"></div>
-    <input id="weight-input" class="input" type="number" step="0.1" placeholder="Weight (lbs)" style="margin-bottom:8px">
-    <input id="weight-notes-input" class="input" placeholder="Notes (optional)" style="margin-bottom:16px">
-    <div style="display:flex;gap:8px;justify-content:flex-end">
-      <button class="btn secondary" onclick="closeWeightDialog()">Cancel</button>
-      <button class="btn" onclick="saveWeightEntry()">Save</button>
+<!-- Health log dialog -->
+<div id="health-dialog" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:100;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border-radius:12px;padding:24px;min-width:300px;max-width:400px;width:90%;border:1px solid var(--border)">
+    <h3 style="margin-bottom:12px">Log Health Data</h3>
+    <div id="health-dialog-date" style="font-size:0.8rem;color:var(--muted);margin-bottom:12px"></div>
+    <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><input type="checkbox" id="hlog-weight-chk"> ⚖️ Weight</label>
+    <div id="hlog-weight-fields" style="display:none;margin-bottom:10px">
+      <input id="hlog-weight" class="input" type="number" step="0.1" placeholder="Weight (lbs)">
+    </div>
+    <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><input type="checkbox" id="hlog-heart-chk"> ❤️ Heart Rate</label>
+    <div id="hlog-heart-fields" style="display:none;margin-bottom:10px">
+      <input id="hlog-bpm" class="input" type="number" placeholder="BPM">
+    </div>
+    <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><input type="checkbox" id="hlog-bp-chk"> 🩺 Blood Pressure</label>
+    <div id="hlog-bp-fields" style="display:none;margin-bottom:10px;display:none">
+      <div style="display:flex;gap:8px">
+        <input id="hlog-sys" class="input" type="number" placeholder="Systolic" style="flex:1">
+        <input id="hlog-dia" class="input" type="number" placeholder="Diastolic" style="flex:1">
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+      <button class="btn secondary" onclick="closeHealthLog()">Cancel</button>
+      <button class="btn" onclick="saveHealthLog()">Save</button>
     </div>
   </div>
 </div>
@@ -704,7 +771,7 @@ function buildDashboardHtml(token) {
 const TOKEN = '${token}';
 const BASE = window.location.origin;
 
-let state = { cats: {}, location: null, clients: 0, mute: null, tasks: { active: [], completed: [] } };
+let state = { cats: {}, location: null, clients: 0, mute: null, tasks: { active: [], completed: [] }, health: { weight: [], heartRate: [], bloodPressure: [] } };
 
 // SSE connection
 function connectSSE() {
@@ -729,6 +796,12 @@ function connectSSE() {
     state.tasks = { active: d.active || [], completed: d.completed || [] };
     renderTasks();
   });
+  es.addEventListener('health_data', e => {
+    const d = JSON.parse(e.data);
+    state.health.heartRate = d.heartRate || [];
+    state.health.bloodPressure = d.bloodPressure || [];
+    renderHealth();
+  });
   es.onerror = () => {
     document.getElementById('conn-status').textContent = '● reconnecting...';
     document.getElementById('conn-status').style.color = '#f44336';
@@ -742,8 +815,11 @@ function applyInit(d) {
   state.places = d.places || [];
   state.clients = d.clients || 0;
   if (d.tasks) state.tasks = d.tasks;
+  if (d.heartRate !== undefined) state.health.heartRate = d.heartRate;
+  if (d.bloodPressure !== undefined) state.health.bloodPressure = d.bloodPressure;
   render();
   renderTasks();
+  renderHealth();
 }
 
 const CAT_EMOJI = { Ty:'🖤', GentlemanMustachios:'🎩', Nocci:'🍊', Nommy:'🧡', Smoresy:'💜', Cay:'🐾' };
@@ -908,22 +984,42 @@ function refreshPlaces() {
   api('GET', '/location/places').then(d => { state.places = d.places || []; render(); });
 }
 
-// ---- Weight graph ----
-let weightEntries = [];
-let weightRange = 'month'; // 'week' | 'month' | 'year'
-const WEIGHT_DAYS = { week: 7, month: 30, year: 365 };
+// ---- Health graph ----
+let weightEntries = []; // kept for weight-only initial fetch
+let healthRange = 'month';
+const HEALTH_DAYS = { week: 7, month: 30, year: 365 };
+let healthSeriesVis = { weight: true, heart: true, bp: true };
+let healthDetailVisible = false;
 
 function loadWeight() {
   api('GET', '/weight/history').then(d => {
-    weightEntries = d.entries || [];
-    renderWeight();
+    state.health.weight = d.entries || [];
+    weightEntries = state.health.weight;
+    renderHealth();
   });
 }
 
-function cycleWeightRange() {
-  weightRange = weightRange === 'week' ? 'month' : weightRange === 'month' ? 'year' : 'week';
-  document.getElementById('weight-range-btn').textContent = weightRange;
-  renderWeight();
+function cycleHealthRange() {
+  healthRange = healthRange === 'week' ? 'month' : healthRange === 'month' ? 'year' : 'week';
+  document.getElementById('health-range-btn').textContent = healthRange;
+  renderHealth();
+}
+
+// Keep old alias for any remaining calls
+function cycleWeightRange() { cycleHealthRange(); }
+
+function toggleHealthSeries(s) {
+  healthSeriesVis[s] = !healthSeriesVis[s];
+  const btn = document.getElementById('hshow-' + s);
+  if (btn) btn.style.opacity = healthSeriesVis[s] ? '1' : '0.4';
+  renderHealth();
+}
+
+function toggleHealthDetail() {
+  healthDetailVisible = !healthDetailVisible;
+  document.getElementById('health-detail').style.display = healthDetailVisible ? 'block' : 'none';
+  document.getElementById('health-detail-btn').textContent = healthDetailVisible ? 'detail ▾' : 'detail ▸';
+  if (healthDetailVisible) renderHealthDetail();
 }
 
 function renderWeight() {
@@ -1044,6 +1140,193 @@ function closeWeightDialog() {
 }
 
 function saveWeightEntry() {
+  const today = new Date().toISOString().slice(0, 10);
+  const w = parseFloat(document.getElementById('weight-input').value);
+  if (isNaN(w)) { alert('Enter a valid weight'); return; }
+  api('POST', '/weight/entry', { date: today, weight: w, notes: '' })
+    .then(d => { if (d.ok) { closeWeightDialog(); loadWeight(); } });
+}
+
+// ---- Health rendering ----
+
+function drawHealthCanvas(canvas, entries, colorHex, valueKey, labelText) {
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = canvas.offsetHeight * dpr;
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = canvas.offsetHeight;
+
+  const today = new Date(); today.setHours(0,0,0,0);
+  const cutoff = new Date(today.getTime() - HEALTH_DAYS[healthRange] * 86400000);
+  const filtered = entries.filter(e => new Date(e.date + 'T00:00:00') >= cutoff)
+    .sort((a,b) => a.date.localeCompare(b.date));
+
+  if (filtered.length === 0) {
+    ctx.fillStyle = '#555'; ctx.font = '11px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(labelText + ': no data', W/2, H/2);
+    return;
+  }
+
+  const padL = 38, padR = 8, padT = 6, padB = 16;
+  const gW = W - padL - padR, gH = H - padT - padB;
+  const axisStartMs = cutoff.getTime(), axisRangeMs = today.getTime() - axisStartMs || 1;
+  const vals = filtered.map(e => e[valueKey]);
+  const minV = Math.floor(Math.min(...vals) - 2), maxV = Math.ceil(Math.max(...vals) + 2);
+  const rangeV = maxV - minV || 1;
+  const xOf = d => padL + ((new Date(d+'T00:00:00').getTime() - axisStartMs) / axisRangeMs) * gW;
+  const yOf = v => padT + gH - ((v - minV) / rangeV) * gH;
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.07)'; ctx.lineWidth = 0.5;
+  ctx.fillStyle = '#777'; ctx.font = '8px sans-serif'; ctx.textAlign = 'right';
+  for (let i = 0; i <= 3; i++) {
+    const val = minV + (rangeV * i / 3), y = yOf(val);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W-padR, y); ctx.stroke();
+    ctx.fillText(Math.round(val), padL-2, y+3);
+  }
+
+  if (filtered.length > 1) {
+    ctx.beginPath(); ctx.strokeStyle = colorHex; ctx.lineWidth = 2;
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    filtered.forEach((e,i) => i===0 ? ctx.moveTo(xOf(e.date),yOf(e[valueKey])) : ctx.lineTo(xOf(e.date),yOf(e[valueKey])));
+    ctx.stroke();
+  }
+  filtered.forEach(e => {
+    ctx.beginPath(); ctx.arc(xOf(e.date), yOf(e[valueKey]), 3, 0, Math.PI*2);
+    ctx.fillStyle = colorHex; ctx.fill();
+  });
+
+  const last = filtered[filtered.length-1];
+  return last[valueKey];
+}
+
+function renderHealth() {
+  const h = state.health || {};
+  const today = new Date(); today.setHours(0,0,0,0);
+  const cutoff = new Date(today.getTime() - HEALTH_DAYS[healthRange] * 86400000);
+
+  const canvas = document.getElementById('health-mini-canvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = 120 * dpr;
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = 120;
+
+  const padL = 8, padR = 8, padT = 8, padB = 8;
+  const gW = W - padL - padR, gH = H - padT - padB;
+  const axisStartMs = cutoff.getTime(), axisRangeMs = today.getTime() - axisStartMs || 1;
+  const xOf = d => padL + ((new Date(d+'T00:00:00').getTime() - axisStartMs) / axisRangeMs) * gW;
+
+  // Each series independently scaled
+  function drawSeries(entries, valueKey, color, isVisible) {
+    if (!isVisible || !entries || entries.length === 0) return;
+    const filtered = entries.filter(e => new Date(e.date+'T00:00:00') >= cutoff).sort((a,b)=>a.date.localeCompare(b.date));
+    if (filtered.length === 0) return;
+    const vals = filtered.map(e => e[valueKey]);
+    const minV = Math.min(...vals)-2, maxV = Math.max(...vals)+2, rV = maxV-minV||1;
+    const yOf = v => padT + gH - ((v-minV)/rV)*gH;
+    if (filtered.length > 1) {
+      ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineJoin='round'; ctx.lineCap='round';
+      filtered.forEach((e,i) => i===0?ctx.moveTo(xOf(e.date),yOf(e[valueKey])):ctx.lineTo(xOf(e.date),yOf(e[valueKey])));
+      ctx.stroke();
+    }
+    filtered.forEach(e => { ctx.beginPath(); ctx.arc(xOf(e.date),yOf(e[valueKey]),3,0,Math.PI*2); ctx.fillStyle=color; ctx.fill(); });
+  }
+
+  ctx.fillStyle = 'var(--surface2)';
+  ctx.fillRect(0,0,W,H);
+  drawSeries(h.weight||[], 'weight', '#BB86FC', healthSeriesVis.weight);
+  drawSeries(h.heartRate||[], 'bpm', '#F44336', healthSeriesVis.heart);
+  drawSeries(h.bloodPressure||[], 'systolic', '#2196F3', healthSeriesVis.bp);
+  drawSeries(h.bloodPressure||[], 'diastolic', '#00BCD4', healthSeriesVis.bp);
+
+  const latestEl = document.getElementById('health-latest');
+  if (latestEl) {
+    const parts = [];
+    const lw = (h.weight||[]).slice(-1)[0]; if (lw) parts.push(lw.weight+' lbs');
+    const lh = (h.heartRate||[]).slice(-1)[0]; if (lh) parts.push(lh.bpm+' bpm');
+    const lb = (h.bloodPressure||[]).slice(-1)[0]; if (lb) parts.push(lb.systolic+'/'+lb.diastolic);
+    latestEl.textContent = parts.length ? parts.join(' · ') : '';
+  }
+
+  if (healthDetailVisible) renderHealthDetail();
+}
+
+function renderHealthDetail() {
+  const h = state.health || {};
+  drawHealthCanvas(document.getElementById('health-weight-canvas'), h.weight||[], '#BB86FC', 'weight', 'Weight');
+  drawHealthCanvas(document.getElementById('health-heart-canvas'), h.heartRate||[], '#F44336', 'bpm', 'Heart Rate');
+  // BP: two series on one canvas
+  const bpCanvas = document.getElementById('health-bp-canvas');
+  if (bpCanvas) {
+    const bpData = h.bloodPressure || [];
+    const today = new Date(); today.setHours(0,0,0,0);
+    const cutoff = new Date(today.getTime() - HEALTH_DAYS[healthRange] * 86400000);
+    const filtered = bpData.filter(e => new Date(e.date+'T00:00:00') >= cutoff).sort((a,b)=>a.date.localeCompare(b.date));
+    if (filtered.length === 0) {
+      const ctx = bpCanvas.getContext('2d');
+      const dpr = window.devicePixelRatio||1;
+      bpCanvas.width = bpCanvas.offsetWidth*dpr; bpCanvas.height = bpCanvas.offsetHeight*dpr;
+      ctx.scale(dpr,dpr); ctx.fillStyle='#555'; ctx.font='11px sans-serif'; ctx.textAlign='center';
+      ctx.fillText('Blood Pressure: no data', bpCanvas.offsetWidth/2, bpCanvas.offsetHeight/2);
+    } else {
+      // Draw both systolic and diastolic scaled together
+      const ctx = bpCanvas.getContext('2d');
+      const dpr = window.devicePixelRatio||1;
+      const rect = bpCanvas.getBoundingClientRect();
+      bpCanvas.width = rect.width*dpr; bpCanvas.height = bpCanvas.offsetHeight*dpr;
+      ctx.scale(dpr,dpr);
+      const W = rect.width, H = bpCanvas.offsetHeight;
+      const padL=38,padR=8,padT=6,padB=16,gW=W-padL-padR,gH=H-padT-padB;
+      const axisStartMs=cutoff.getTime(),axisRangeMs=today.getTime()-axisStartMs||1;
+      const xOf = d => padL+((new Date(d+'T00:00:00').getTime()-axisStartMs)/axisRangeMs)*gW;
+      const allVals=[...filtered.map(e=>e.systolic),...filtered.map(e=>e.diastolic)];
+      const minV=Math.floor(Math.min(...allVals)-2),maxV=Math.ceil(Math.max(...allVals)+2),rV=maxV-minV||1;
+      const yOf=v=>padT+gH-((v-minV)/rV)*gH;
+      ctx.strokeStyle='rgba(255,255,255,0.07)';ctx.lineWidth=0.5;
+      ctx.fillStyle='#777';ctx.font='8px sans-serif';ctx.textAlign='right';
+      for(let i=0;i<=3;i++){const val=minV+(rV*i/3),y=yOf(val);ctx.beginPath();ctx.moveTo(padL,y);ctx.lineTo(W-padR,y);ctx.stroke();ctx.fillText(Math.round(val),padL-2,y+3);}
+      [['#2196F3','systolic'],['#00BCD4','diastolic']].forEach(([col,key])=>{
+        ctx.beginPath();ctx.strokeStyle=col;ctx.lineWidth=2;ctx.lineJoin='round';ctx.lineCap='round';
+        filtered.forEach((e,i)=>i===0?ctx.moveTo(xOf(e.date),yOf(e[key])):ctx.lineTo(xOf(e.date),yOf(e[key])));
+        ctx.stroke();
+        filtered.forEach(e=>{ctx.beginPath();ctx.arc(xOf(e.date),yOf(e[key]),3,0,Math.PI*2);ctx.fillStyle=col;ctx.fill();});
+      });
+    }
+  }
+}
+
+function showHealthLog() {
+  const dlg = document.getElementById('health-log-dialog');
+  if (dlg) dlg.style.display = 'flex';
+}
+function closeHealthLog() {
+  const dlg = document.getElementById('health-log-dialog'); if (dlg) dlg.style.display='none';
+}
+function saveHealthEntry() {
+  const today = new Date().toISOString().slice(0,10);
+  const promises = [];
+  if (document.getElementById('hlog-weight-chk').checked) {
+    const w = parseFloat(document.getElementById('hlog-weight').value);
+    if (!isNaN(w)) promises.push(api('POST','/weight/entry',{date:today,weight:w,notes:''}).then(d=>{if(d.ok)loadWeight();}));
+  }
+  if (document.getElementById('hlog-heart-chk').checked) {
+    const b = parseInt(document.getElementById('hlog-bpm').value);
+    if (!isNaN(b)) promises.push(api('POST','/health/heart-rate',{date:today,bpm:b}));
+  }
+  if (document.getElementById('hlog-bp-chk').checked) {
+    const s=parseInt(document.getElementById('hlog-sys').value),d2=parseInt(document.getElementById('hlog-dia').value);
+    if (!isNaN(s)&&!isNaN(d2)) promises.push(api('POST','/health/blood-pressure',{date:today,systolic:s,diastolic:d2}));
+  }
+  Promise.all(promises).then(()=>closeHealthLog());
+}
+
+function OLD_saveWeightEntry_unused() {
   const today = new Date().toISOString().slice(0, 10);
   const w = parseFloat(document.getElementById('weight-input').value);
   const notes = document.getElementById('weight-notes-input').value.trim();
