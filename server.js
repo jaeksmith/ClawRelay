@@ -1457,6 +1457,7 @@ function renderTaskList() {
         <div style="display:flex;gap:10px;font-size:0.68rem;color:var(--muted);margin-top:4px">
           <span>type:\${t.type}</span>
           <span>spawned:\${fmt(t.spawnedAt)}</span>
+          \${t.priorFailures > 0 ? '<span style="color:#ffc107">' + t.priorFailures + ' prior failure' + (t.priorFailures>1?'s':'') + '</span>' : ''}
           \${remaining !== null && remaining > 0 ? \`<span style="color:\${remaining<300?'#ffc107':'var(--muted)'}">timeout:\${Math.floor(remaining/60)}m</span>\` : ''}
         </div>
       </div>\` : ''}
