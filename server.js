@@ -1691,7 +1691,7 @@ function renderNotes() {
   const prioColor = p => p > 0.7 ? '#4caf50' : p >= 0.3 ? '#ffc107' : '#888';
   const renderTags = tags => (tags||[]).map(t => '<span class="tag" style="margin-right:3px">' + t + '</span>').join('');
 
-  const renderItem = n => '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);cursor:pointer" onclick="openEditNoteModal(\'' + n.id + '\')">' +
+  const renderItem = n => '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);cursor:pointer" onclick="openEditNoteModal(&quot;' + n.id + '&quot;)">' +
     '<span style="width:10px;height:10px;border-radius:50%;background:' + prioColor(n.priority||0.5) + ';flex-shrink:0;display:inline-block"></span>' +
     '<div style="flex:1;min-width:0">' +
       '<div style="font-weight:600;font-size:0.9rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + n.name + '</div>' +
