@@ -946,7 +946,7 @@ function buildDashboardHtml(token) {
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
       <button class="btn secondary" onclick="closeHealthLog()">Cancel</button>
-      <button class="btn" onclick="saveHealthLog()">Save</button>
+      <button class="btn" onclick="saveHealthEntry()">Save</button>
     </div>
   </div>
 </div>
@@ -1518,19 +1518,7 @@ function saveHealthEntry() {
   Promise.all(promises).then(()=>closeHealthLog());
 }
 
-function OLD_saveWeightEntry_unused() {
-  const today = new Date().toISOString().slice(0, 10);
-  const w = parseFloat(document.getElementById('weight-input').value);
-  const notes = document.getElementById('weight-notes-input').value.trim();
-  if (isNaN(w)) { alert('Enter a valid weight'); return; }
-  api('POST', '/weight/entry', { date: today, weight: w, notes })
-    .then(d => {
-      if (d.ok) {
-        closeWeightDialog();
-        loadWeight();
-      }
-    });
-}
+// (old weight-only dialog removed — use health log dialog instead)
 
 // Refresh display every 10s — updates timestamps and client-side stall detection
 setInterval(() => { render(); renderTasks(); }, 10000);
