@@ -1033,16 +1033,17 @@ function render() {
       const safeName = name.replace(/'/g, "\\'");
       const isOutdoorOnly = cat.outdoorOnly;
       const imgSrc = CAT_IMG(name);
+      const q = name.replace(/"/g, '&quot;'); // safe for HTML attribute double-quote context
       const btnHtml = !isOutdoorOnly
         ? '<div style="display:flex;gap:4px;margin-top:6px;justify-content:center">'
-          + '<button class="state-btn' + (st==='inside'?' active-btn':'') + '" onclick="setCatState(\'' + safeName + '\',\'inside\')">in</button>'
-          + '<button class="state-btn' + (st==='outside'?' active-btn':'') + '" onclick="setCatState(\'' + safeName + '\',\'outside\')">out</button>'
-          + '<button class="state-btn' + (st==='unknown'?' active-btn':'') + '" onclick="setCatState(\'' + safeName + '\',\'unknown\')">?</button>'
+          + '<button class="state-btn' + (st==='inside'?' active-btn':'') + '" onclick="setCatState(&quot;' + q + '&quot;,&quot;inside&quot;)">in</button>'
+          + '<button class="state-btn' + (st==='outside'?' active-btn':'') + '" onclick="setCatState(&quot;' + q + '&quot;,&quot;outside&quot;)">out</button>'
+          + '<button class="state-btn' + (st==='unknown'?' active-btn':'') + '" onclick="setCatState(&quot;' + q + '&quot;,&quot;unknown&quot;)">?</button>'
           + '</div>'
         : '<div style="font-size:0.65rem;color:var(--muted);margin-top:4px">outdoor</div>';
       return '<div class="cat-tile ' + st + '">'
         + '<img class="cat-img" src="' + imgSrc + '" alt="' + name + '"'
-        + ' onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'block\'">'
+        + ' onerror="this.style.display=&quot;none&quot;;this.nextElementSibling.style.display=&quot;block&quot;">'
         + '<div class="cat-img-placeholder" style="display:none">' + emoji + '</div>'
         + '<div class="cat-name">' + name + '</div>'
         + '<div class="cat-state">' + st + (ago ? ' · '+ago : '') + '</div>'
