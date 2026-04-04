@@ -7,6 +7,7 @@ const cats = require('./cats');
 const location = require('./location');
 const weight = require('./weight');
 const health = require('./health');
+const notes = require('./notes');
 
 const WS_PORT = 18790;
 const HTTP_PORT = 18791;
@@ -44,6 +45,8 @@ function pushToClients(payload, targetId = null) {
     broadcastSSE('task_update', { active: payload.active, completed: payload.completed });
   } else if (payload.action === 'health_data') {
     broadcastSSE('health_data', { heartRate: payload.heartRate, bloodPressure: payload.bloodPressure });
+  } else if (payload.action === 'notes_update') {
+    broadcastSSE('notes_update', { notes: payload.notes });
   } else {
     const isCatAction = payload.action?.startsWith('cat') || payload.action === 'mute_state';
     broadcastSSE('update', {
@@ -92,6 +95,12 @@ wss.on('connection', (ws, req) => {
           type: 'command', action: 'task_update',
           active: readTasksJson(TASKS_ACTIVE_PATH).tasks || [],
           completed: (readTasksJson(TASKS_COMPLETED_PATH).tasks || []).slice(-20)
+        }));
+        // Send notes data to new client
+        ws.send(JSON.stringify({
+          type: 'notes_data',
+          notes: notes.listNotes(false),
+          settings: notes.getSettings()
         }));
 
       } else if (msg.type === 'cat_state_update') {
@@ -176,6 +185,45 @@ wss.on('connection', (ws, req) => {
         const result = health.addBloodPressure(msg.date, msg.systolic, msg.diastolic);
         ws.send(JSON.stringify({ type: 'health_ack', ...result }));
         pushToClients({ action: 'health_data', heartRate: health.parseHeartRate(), bloodPressure: health.parseBloodPressure() });
+
+      } else if (msg.type === 'create_note') {
+        const result = notes.createNote(msg.name, msg.content || '', msg.meta || {});
+        ws.send(JSON.stringify({ type: 'note_ack', ...result }));
+        const allNotes = notes.listNotes(false);
+        pushToClients({ action: 'notes_update', notes: allNotes });
+        broadcastSSE('notes_update', { notes: allNotes });
+
+      } else if (msg.type === 'update_note') {
+        const result = notes.updateNote(msg.id, msg.content, msg.meta || {});
+        ws.send(JSON.stringify({ type: 'note_ack', ...result }));
+        const allNotes = notes.listNotes(false);
+        pushToClients({ action: 'notes_update', notes: allNotes });
+        broadcastSSE('notes_update', { notes: allNotes });
+
+      } else if (msg.type === 'archive_note') {
+        const result = notes.archiveNote(msg.id);
+        ws.send(JSON.stringify({ type: 'note_ack', ...result }));
+        const allNotes = notes.listNotes(false);
+        pushToClients({ action: 'notes_update', notes: allNotes });
+        broadcastSSE('notes_update', { notes: allNotes });
+
+      } else if (msg.type === 'unarchive_note') {
+        const result = notes.unarchiveNote(msg.id);
+        ws.send(JSON.stringify({ type: 'note_ack', ...result }));
+        const allNotes = notes.listNotes(false);
+        pushToClients({ action: 'notes_update', notes: allNotes });
+        broadcastSSE('notes_update', { notes: allNotes });
+
+      } else if (msg.type === 'delete_note') {
+        const result = notes.deleteNote(msg.id);
+        ws.send(JSON.stringify({ type: 'note_ack', ...result }));
+        const allNotes = notes.listNotes(false);
+        pushToClients({ action: 'notes_update', notes: allNotes });
+        broadcastSSE('notes_update', { notes: allNotes });
+
+      } else if (msg.type === 'save_draft') {
+        const result = notes.saveDraft(msg.id, msg.content || '');
+        ws.send(JSON.stringify({ type: 'draft_ack', ...result }));
 
       } else if (msg.type === 'pong') {
         // keepalive
@@ -537,6 +585,100 @@ watchTaskFile(TASKS_COMPLETED_PATH);
 app.get('/tasks', authCheck, (req, res) => res.json(readTasksJson(TASKS_ACTIVE_PATH)));
 app.get('/tasks/completed', authCheck, (req, res) => res.json(readTasksJson(TASKS_COMPLETED_PATH)));
 
+// --- Notes API ---
+
+function notesUpdate() {
+  const allNotes = notes.listNotes(false);
+  pushToClients({ action: 'notes_update', notes: allNotes });
+  broadcastSSE('notes_update', { notes: allNotes });
+}
+
+app.get('/notes/settings', authCheck, (req, res) => {
+  res.json(notes.getSettings());
+});
+
+app.put('/notes/settings', authCheck, (req, res) => {
+  const result = notes.saveSettings(req.body || {});
+  res.json(result);
+});
+
+app.get('/notes', authCheck, (req, res) => {
+  const includeArchived = req.query.archived === 'true';
+  let list = notes.listNotes(includeArchived);
+  if (req.query.tag) {
+    const tag = req.query.tag.toLowerCase();
+    list = list.filter(m => (m.tags || []).some(t => t.toLowerCase().includes(tag)));
+  }
+  if (req.query.show != null) {
+    const show = req.query.show === 'true';
+    list = list.filter(m => m.show === show);
+  }
+  if (req.query.search) {
+    const q = req.query.search.toLowerCase();
+    list = list.filter(m => m.name.toLowerCase().includes(q) || (m.tags || []).some(t => t.toLowerCase().includes(q)));
+  }
+  res.json({ notes: list });
+});
+
+app.post('/notes', authCheck, (req, res) => {
+  const { name, content, tags, priority, show, createdBy } = req.body || {};
+  const result = notes.createNote(name || null, content || '', { tags, priority, show, createdBy });
+  notesUpdate();
+  res.json(result);
+});
+
+app.get('/notes/:id', authCheck, (req, res) => {
+  const note = notes.getNote(req.params.id);
+  if (!note) return res.status(404).json({ error: 'not found' });
+  res.json(note);
+});
+
+app.put('/notes/:id', authCheck, (req, res) => {
+  const { content, ...meta } = req.body || {};
+  const result = notes.updateNote(req.params.id, content, meta);
+  if (!result) return res.status(404).json({ error: 'not found' });
+  notesUpdate();
+  res.json(result);
+});
+
+app.delete('/notes/:id', authCheck, (req, res) => {
+  if (!req.body?.confirmed) return res.status(400).json({ error: 'confirmed required' });
+  const result = notes.deleteNote(req.params.id);
+  if (!result.ok) return res.status(404).json(result);
+  notesUpdate();
+  res.json(result);
+});
+
+app.post('/notes/:id/archive', authCheck, (req, res) => {
+  const result = notes.archiveNote(req.params.id);
+  if (!result.ok) return res.status(404).json(result);
+  notesUpdate();
+  res.json(result);
+});
+
+app.post('/notes/:id/unarchive', authCheck, (req, res) => {
+  const result = notes.unarchiveNote(req.params.id);
+  if (!result.ok) return res.status(404).json(result);
+  notesUpdate();
+  res.json(result);
+});
+
+app.get('/notes/:id/draft', authCheck, (req, res) => {
+  const draft = notes.getDraft(req.params.id);
+  if (!draft) return res.status(404).json({ error: 'no draft' });
+  res.json(draft);
+});
+
+app.post('/notes/:id/draft', authCheck, (req, res) => {
+  const result = notes.saveDraft(req.params.id, req.body?.content || '');
+  res.json(result);
+});
+
+app.delete('/notes/:id/draft', authCheck, (req, res) => {
+  const result = notes.deleteDraft(req.params.id);
+  res.json(result);
+});
+
 // --- SSE: real-time event stream for the web dashboard ---
 const sseClients = new Set();
 
@@ -565,7 +707,9 @@ app.get('/events', authCheck, (req, res) => {
       completed: (readTasksJson(TASKS_COMPLETED_PATH).tasks || []).slice(-20)
     },
     heartRate: health.parseHeartRate(),
-    bloodPressure: health.parseBloodPressure()
+    bloodPressure: health.parseBloodPressure(),
+    notes: notes.listNotes(false),
+    noteSettings: notes.getSettings()
   })}\n\n`);
 
   req.on('close', () => sseClients.delete(res));
@@ -738,6 +882,46 @@ function buildDashboardHtml(token) {
       <canvas id="health-bp-canvas" height="100" style="width:100%"></canvas>
     </div>
   </div>
+<!-- Notes Card -->
+<div class="card" style="grid-column: 1 / -1; margin-top: 16px" id="notes-card">
+  <h2 style="display:flex;justify-content:space-between;align-items:center">
+    📝 Notes
+    <button class="btn" style="font-size:0.75rem;padding:4px 12px" onclick="openNewNoteModal()">+ New Note</button>
+  </h2>
+  <div id="notes-list-top">Loading...</div>
+  <div style="margin-top:8px">
+    <button class="btn secondary" style="font-size:0.75rem;padding:4px 12px;width:100%" onclick="toggleAllNotes()">All Notes ▾</button>
+  </div>
+  <div id="notes-all-section" style="display:none;margin-top:12px">
+    <div style="display:flex;gap:8px;margin-bottom:8px">
+      <input id="notes-search" class="input" placeholder="Search notes..." style="flex:1" oninput="renderNotes()">
+      <input id="notes-tag-filter" class="input" placeholder="Tag filter..." style="flex:1" oninput="renderNotes()">
+    </div>
+    <div id="notes-list-all"></div>
+  </div>
+</div>
+</div>
+
+<!-- Note modal -->
+<div id="note-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:200;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border-radius:12px;padding:24px;min-width:340px;max-width:700px;width:95%;border:1px solid var(--border);max-height:90vh;overflow-y:auto">
+    <h3 id="note-modal-title" style="margin-bottom:12px">New Note</h3>
+    <input id="note-modal-name" class="input" placeholder="Name (auto-generated if blank)" style="margin-bottom:10px">
+    <textarea id="note-modal-content" class="input" rows="8" style="margin-bottom:10px;resize:vertical;font-family:monospace" placeholder="Content (markdown)"></textarea>
+    <input id="note-modal-tags" class="input" placeholder="Tags (comma-separated)" style="margin-bottom:10px">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+      <label style="font-size:0.85rem">Priority (0–1):</label>
+      <input id="note-modal-priority" class="input" type="number" min="0" max="1" step="0.01" value="0.5" style="width:80px">
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px">
+      <input type="checkbox" id="note-modal-show" checked>
+      <label for="note-modal-show" style="font-size:0.85rem">Show on home</label>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn secondary" onclick="closeNoteModal()">Cancel</button>
+      <button class="btn" onclick="saveNoteModal()">Save</button>
+    </div>
+  </div>
 </div>
 
 <!-- Health log dialog -->
@@ -771,7 +955,7 @@ function buildDashboardHtml(token) {
 const TOKEN = '${token}';
 const BASE = window.location.origin;
 
-let state = { cats: {}, location: null, clients: 0, mute: null, tasks: { active: [], completed: [] }, health: { weight: [], heartRate: [], bloodPressure: [] } };
+let state = { cats: {}, location: null, clients: 0, mute: null, tasks: { active: [], completed: [] }, health: { weight: [], heartRate: [], bloodPressure: [] }, notes: [], noteSettings: { maxShowOnHome: 5 } };
 
 // SSE connection
 function connectSSE() {
@@ -802,6 +986,11 @@ function connectSSE() {
     state.health.bloodPressure = d.bloodPressure || [];
     renderHealth();
   });
+  es.addEventListener('notes_update', e => {
+    const d = JSON.parse(e.data);
+    state.notes = d.notes || [];
+    renderNotes();
+  });
   es.onerror = () => {
     document.getElementById('conn-status').textContent = '● reconnecting...';
     document.getElementById('conn-status').style.color = '#f44336';
@@ -815,11 +1004,14 @@ function applyInit(d) {
   state.places = d.places || [];
   state.clients = d.clients || 0;
   if (d.tasks) state.tasks = d.tasks;
+  if (d.notes !== undefined) state.notes = d.notes;
+  if (d.noteSettings !== undefined) state.noteSettings = d.noteSettings;
   if (d.heartRate !== undefined) state.health.heartRate = d.heartRate;
   if (d.bloodPressure !== undefined) state.health.bloodPressure = d.bloodPressure;
   render();
   renderTasks();
   renderHealth();
+  renderNotes();
 }
 
 const CAT_EMOJI = { Ty:'🖤', GentlemanMustachios:'🎩', Nocci:'🍊', Nommy:'🧡', Smoresy:'💜', Cay:'🐾' };
@@ -1477,6 +1669,112 @@ Promise.all([
     completed: (completed.tasks || []).slice(-20)
   };
   renderTasks();
+}).catch(() => {});
+
+
+// ── Notes ────────────────────────────────────────────────────────────────────
+let notesExpanded = false;
+let editingNoteId = null;
+
+function toggleAllNotes() {
+  notesExpanded = !notesExpanded;
+  document.getElementById('notes-all-section').style.display = notesExpanded ? 'block' : 'none';
+  renderNotes();
+}
+
+function renderNotes() {
+  const topEl = document.getElementById('notes-list-top');
+  const allEl = document.getElementById('notes-list-all');
+  const search = (document.getElementById('notes-search')?.value || '').toLowerCase();
+  const tagF = (document.getElementById('notes-tag-filter')?.value || '').toLowerCase();
+
+  const sorted = (state.notes || [])
+    .filter(n => !n.archived)
+    .slice()
+    .sort((a,b) => (b.priority||0.5) - (a.priority||0.5) || b.modifiedAt - a.modifiedAt);
+
+  const showNotes = sorted.filter(n => n.show !== false).slice(0, state.noteSettings?.maxShowOnHome || 5);
+
+  const fmtDate = ms => ms ? new Date(ms).toLocaleDateString([], {month:'numeric',day:'numeric',year:'2-digit'}) : '';
+  const prioColor = p => p > 0.7 ? '#4caf50' : p >= 0.3 ? '#ffc107' : '#888';
+  const renderTags = tags => (tags||[]).map(t => '<span class="tag" style="margin-right:3px">' + t + '</span>').join('');
+
+  const renderItem = n => '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);cursor:pointer" onclick="openEditNoteModal(\'' + n.id + '\')">' +
+    '<span style="width:10px;height:10px;border-radius:50%;background:' + prioColor(n.priority||0.5) + ';flex-shrink:0;display:inline-block"></span>' +
+    '<div style="flex:1;min-width:0">' +
+      '<div style="font-weight:600;font-size:0.9rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + n.name + '</div>' +
+      '<div style="font-size:0.7rem;color:var(--muted)">' + renderTags(n.tags) + ' ' + fmtDate(n.modifiedAt) + '</div>' +
+    '</div>' +
+  '</div>';
+
+  if (showNotes.length === 0) {
+    topEl.innerHTML = '<div style="color:var(--muted);font-size:0.85rem">No notes yet. Create one!</div>';
+  } else {
+    topEl.innerHTML = showNotes.map(renderItem).join('');
+  }
+
+  if (notesExpanded && allEl) {
+    let filtered = sorted;
+    if (search) filtered = filtered.filter(n => n.name.toLowerCase().includes(search) || (n.tags||[]).some(t=>t.toLowerCase().includes(search)));
+    if (tagF) filtered = filtered.filter(n => (n.tags||[]).some(t=>t.toLowerCase().includes(tagF)));
+    allEl.innerHTML = filtered.length ? filtered.map(renderItem).join('') : '<div style="color:var(--muted);font-size:0.85rem">No matching notes</div>';
+  }
+}
+
+function openNewNoteModal() {
+  editingNoteId = null;
+  document.getElementById('note-modal-title').textContent = 'New Note';
+  document.getElementById('note-modal-name').value = '';
+  document.getElementById('note-modal-content').value = '';
+  document.getElementById('note-modal-tags').value = '';
+  document.getElementById('note-modal-priority').value = '0.5';
+  document.getElementById('note-modal-show').checked = true;
+  document.getElementById('note-modal').style.display = 'flex';
+}
+
+function openEditNoteModal(id) {
+  editingNoteId = id;
+  document.getElementById('note-modal-title').textContent = 'Edit Note';
+  document.getElementById('note-modal').style.display = 'flex';
+  // Fetch full note content
+  api('GET', '/notes/' + id).then(d => {
+    const m = d.meta || {};
+    document.getElementById('note-modal-name').value = m.name || id;
+    document.getElementById('note-modal-content').value = d.content || '';
+    document.getElementById('note-modal-tags').value = (m.tags||[]).join(', ');
+    document.getElementById('note-modal-priority').value = (m.priority != null ? m.priority : 0.5).toFixed(2);
+    document.getElementById('note-modal-show').checked = m.show !== false;
+  }).catch(() => {});
+}
+
+function closeNoteModal() {
+  editingNoteId = null;
+  document.getElementById('note-modal').style.display = 'none';
+}
+
+function saveNoteModal() {
+  const name = document.getElementById('note-modal-name').value.trim() || null;
+  const content = document.getElementById('note-modal-content').value;
+  const tagsRaw = document.getElementById('note-modal-tags').value;
+  const tags = tagsRaw ? tagsRaw.split(',').map(t=>t.trim()).filter(Boolean) : [];
+  const priority = parseFloat(document.getElementById('note-modal-priority').value) || 0.5;
+  const show = document.getElementById('note-modal-show').checked;
+
+  if (editingNoteId) {
+    api('PUT', '/notes/' + editingNoteId, { content, name, tags, priority, show })
+      .then(() => { closeNoteModal(); })
+      .catch(() => alert('Save failed'));
+  } else {
+    api('POST', '/notes', { name, content, tags, priority, show })
+      .then(() => { closeNoteModal(); })
+      .catch(() => alert('Create failed'));
+  }
+}
+
+// Load notes on page load
+api('GET', '/notes').then(d => {
+  state.notes = d.notes || [];
+  renderNotes();
 }).catch(() => {});
 
 loadWeight();
